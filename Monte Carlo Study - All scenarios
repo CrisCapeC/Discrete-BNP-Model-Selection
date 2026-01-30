@@ -5,9 +5,7 @@
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -156,9 +154,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -196,7 +192,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
 
 
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -287,9 +283,7 @@ saveRDS(MonteCarloStudy_Logit_n800, file = paste0("MonteCarloStudy_Logit_n800.rd
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -438,9 +432,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -476,7 +468,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
                                "seeds", "n", "true_params", "true_gamma", "prior_params",
                                "n_iter", "n_burn"))
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -577,9 +569,7 @@ saveRDS(MonteCarloStudy_Cloglog_n800, file = paste0("MonteCarloStudy_Cloglog_n80
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -731,9 +721,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -772,7 +760,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
 
 
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 57:100,
@@ -862,9 +850,7 @@ saveRDS(MonteCarloStudy_MultiLogit_n800, file = paste0("MonteCarloStudy_MultiLog
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -1017,9 +1003,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -1056,9 +1040,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
                                "seeds", "n", "true_params", "true_gamma", "prior_params",
                                "n_iter", "n_burn"))
 
-
-
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -1148,9 +1130,7 @@ saveRDS(MonteCarloStudy_MultiCloglog_n800, file = paste0("MonteCarloStudy_MultiC
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -1311,9 +1291,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -1353,8 +1331,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
                                "n_iter", "n_burn"))
 
 
-
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -1453,9 +1430,7 @@ saveRDS(MonteCarloStudy_NominalLogit_n400, file = paste0("MonteCarloStudy_Nomina
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -1607,9 +1582,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -1648,7 +1621,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
 
 
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -1747,9 +1720,7 @@ saveRDS(MonteCarloStudy_ZINB_n800, file = paste0("MonteCarloStudy_ZINB_n800.rds"
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -1899,9 +1870,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -1939,8 +1908,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
                                "n_iter", "n_burn"))
 
 
-
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -2033,9 +2001,7 @@ saveRDS(MonteCarloStudy_Poisson_n800, file = paste0("MonteCarloStudy_Poisson_n80
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -2192,9 +2158,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -2234,8 +2198,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
                                "n_iter", "n_burn"))
 
 
-
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:100,
