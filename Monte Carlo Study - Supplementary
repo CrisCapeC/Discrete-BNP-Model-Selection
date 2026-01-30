@@ -5,9 +5,7 @@
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ##### Simulation function (ZINB)
 #replica_id = 1:n_MC
@@ -77,9 +75,7 @@ MonteCarloSimulation = function(replica_id, seeds_logit, seeds_cloglog, n, true_
 
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -120,7 +116,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation",
                                "true_gamma"))
 
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
@@ -179,9 +175,7 @@ saveRDS(Freq_Binary, file = "AIC_Binary_n200.rds")
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ##### Simulation function
 #replica_id = 1:n_MC
@@ -247,9 +241,7 @@ MonteCarloSimulation = function(replica_id, seeds_logit, seeds_cloglog, n, true_
 
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -291,7 +283,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation",
                                "true_gamma"))
 
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
@@ -348,9 +340,7 @@ saveRDS(Freq_Ordinal, file = "BIC_Ordinal_n400.rds")
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ##### Simulation function (ZINB)
 #replica_id = 1:n_MC
@@ -406,9 +396,7 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma){
 
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -443,7 +431,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "seeds", "n",
                                "true_params", "true_gamma"))
 
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
@@ -493,9 +481,7 @@ saveRDS(list(NLOGmodel_NLOGfit = t(summary_matrix_log)), file = "AIC_Nominal_n20
 rm(list = ls());gc()
 
 
-######################################################
-###########          Functions         ##############
-####################################################
+###########          Functions
 
 ##### Stepwise function for zero-inflated models
 stepwiseZI = function(formula, data, dist = c("poisson", "negbin"), 
@@ -746,9 +732,7 @@ MonteCarloSimulation = function(replica_id, seeds_zinb, seeds_poisson, seeds_gau
 
 
 
-######################################################
-###########      MonteCarlo study      ##############
-####################################################
+###########      MonteCarlo study
 library(parallel)
 
 ##### Simulation setup
@@ -799,7 +783,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "stepwiseZI",
                                "true_gamma"))
 
 
-##### MonteCarlo study
+# Simulation
 library(tictoc)
 tic()
 MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
