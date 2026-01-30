@@ -1,0 +1,2325 @@
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########            Scenario: Logit                ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,0,Inf)
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
+                                      prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
+                                      prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  beta = true_params$beta*true_gamma
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    y = rbinom(n, 1, 1/(1 + exp(-X%*%beta_gamma)))
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_Logit_n",n,"_",replica_id,".rds"))
+  
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 800 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta = c(-1, -2, 1.5, -1.5, 1.2, -1.2))
+prior_params = list(kappa = 10, a_alpha = 0.1, b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2121) #n=200
+} else if(n == 400){
+  set.seed(4121) #n=400
+} else{
+  set.seed(8121) #n=800
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores() #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_BINARY_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 1:n_MC,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+gamma_char = apply(true_gamma, 2, paste0, collapse = "") #collapsed (label)
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = gamma_char
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_Logit_n800 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/Logit/MonteCarloStudy_Logit_n800_",i,".rds")
+  MonteCarloStudy_Logit_n800[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_Logit_n800[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_Logit_n800, file = paste0("MonteCarloStudy_Logit_n800.rds"))
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########            Scenario: Cloglog              ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,0,Inf)
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
+                                      prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
+                                      prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: samplesize
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  beta = true_params$beta*true_gamma
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    y = rbinom(n,1, 1 - exp(-exp(X%*%beta_gamma)))
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_Cloglog_n",n,"_",replica_id,".rds"))
+  
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 800 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta = c(-1, -2, 1.5, -1.5, 1.2, -1.2))
+prior_params = list(kappa = 10, a_alpha = 0.1, b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2312) #n=200
+} else if(n == 400){
+  set.seed(4312) #n=400
+} else{
+  set.seed(8312) #n=800
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_BINARY_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 1:n_MC,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+Model_Selection = matrix(0, nrow = 32, ncol = n_MC)
+colnames(Model_Selection) = paste0("replica",1:n_MC)
+gamma_char = apply(true_gamma, 2, paste0, collapse = "") #collapsed (label)
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = gamma_char
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+    
+    gamma_sim_repi_modelj = MonteCarloStudy[[i]]$model_selection[,,j] #ith replica, jth model, gamma results
+    gamma_aux = apply(gamma_sim_repi_modelj, 2, paste0, collapse = "")
+    Model_Selection[j,i] = names(sort(table(gamma_aux)/8000, decreasing = TRUE))[1] #Name of most likely model
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+data.frame(true_model = apply(true_gamma, 2, paste0, collapse = ""), Freq = rowSums(Model_Selection == apply(true_gamma, 2, paste0, collapse = ""))/n_MC)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_Cloglog_n800 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/Cloglog/MonteCarloStudy_Cloglog_n800_",i,".rds")
+  MonteCarloStudy_Cloglog_n800[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_Cloglog_n800[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_Cloglog_n800, file = paste0("MonteCarloStudy_Cloglog_n800.rds"))
+
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########            Scenario: MultiLogit           ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,-Inf,0,1,2,Inf) #4 categories
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  beta = true_params$beta*true_gamma
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    z = rlogis(n, X%*%beta_gamma, 1)
+    y = cut(z, breaks = c(-Inf, 0, 1, 2, Inf), labels = FALSE)
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_MultiLogit_n",n,"_",replica_id,".rds"))
+  
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 800 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta = c(1, 1.2, -0.7, 0.7, -1.1, 1.1))
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2131) #n=200
+} else if(n == 400){
+  set.seed(4131) #n=400
+} else{
+  set.seed(8131) #n=800
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores() #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 57:100,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = apply(true_gamma, 2, paste0, collapse = "")
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = colnames(gamma_posterior_distributions), las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = colnames(gamma_posterior_distributions), las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_MultiLogit_n800 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/MultiLogit/MonteCarloStudy_MultiLogit_n800_",i,".rds")
+  MonteCarloStudy_MultiLogit_n800[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_MultiLogit_n800[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_MultiLogit_n800, file = paste0("MonteCarloStudy_MultiLogit_n800.rds"))
+
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########            Scenario: MultiCloglog         ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,-Inf,0,1,2,Inf) #4 categories
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  beta = true_params$beta*true_gamma
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    z = X%*%beta_gamma + log(-log(1 - runif(n)))
+    y = cut(z, breaks = c(-Inf, 0, 1, 2, Inf), labels = FALSE)
+    
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_MultiCloglog_n",n,"_",replica_id,".rds"))
+  
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 800 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta = c(1, 1.2, -0.7, 0.7, -1.1, 1.1))
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2133) #n=200
+} else if(n == 400){
+  set.seed(4133) #n=400
+} else{
+  set.seed(8133) #n=800
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores() #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 1:n_MC,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = apply(true_gamma, 2, paste0, collapse = "")
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = colnames(gamma_posterior_distributions), las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = colnames(gamma_posterior_distributions), las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_MultiCloglog_n800 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/MultiCloglog/MonteCarloStudy_MultiCloglog_n800_",i,".rds")
+  MonteCarloStudy_MultiCloglog_n800[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_MultiCloglog_n800[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_MultiCloglog_n800, file = paste0("MonteCarloStudy_MultiCloglog_n800.rds"))
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########            Scenario: NominalLogit         ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,-Inf,0,1,2,Inf) #4 categories
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  beta1 = true_params$beta1*true_gamma
+  beta2 = true_params$beta2*true_gamma
+  beta3 = true_params$beta3*true_gamma
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    exp1 = exp(X%*%beta1[,j])
+    exp2 = exp(X%*%beta2[,j])
+    exp3 = exp(X%*%beta3[,j])
+    
+    denom = 1 + exp1 + exp2 + exp3
+    p1 = exp1/denom
+    p2 = exp2/denom
+    p3 = exp3/denom
+    u = runif(n)
+    y = ifelse(u<p1,1,ifelse(u<p1+p2,2,ifelse(u<p1+p2+p3,3,4)))
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_NominalLogit_n",n,"_",replica_id,".rds"))
+  
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 400 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta1 = c(1.4, -2, 1, 1, -1, -3),
+                   beta2 = c(1.1, -2, 1, -2, 1, -3),
+                   beta3 = c(0.7, 1.4, 1.8, 0.2, 0.5, -2))
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2141) #n=200
+} else if(n == 400){
+  set.seed(4141) #n=400
+} else{
+  set.seed(8141) #n=800
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 1:n_MC,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+Model_Selection = matrix(0, nrow = 32, ncol = n_MC)
+colnames(Model_Selection) = paste0("replica",1:n_MC)
+gamma_char = apply(true_gamma, 2, paste0, collapse = "") #collapsed (label)
+gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = gamma_char
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+    
+    gamma_sim_repi_modelj = MonteCarloStudy[[i]]$model_selection[,,j] #ith replica, jth model, gamma results
+    gamma_aux = apply(gamma_sim_repi_modelj, 2, paste0, collapse = "")
+    Model_Selection[j,i] = names(sort(table(gamma_aux)/(n_iter-n_burn), decreasing = TRUE))[1] #Name of most likely model
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+data.frame(true_model = apply(true_gamma, 2, paste0, collapse = ""), Freq = rowSums(Model_Selection == apply(true_gamma, 2, paste0, collapse = ""))/n_MC)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_NominalLogit_n400 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/NominalLogit/MonteCarloStudy_NominalLogit_n400_",i,".rds")
+  MonteCarloStudy_NominalLogit_n400[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_NominalLogit_n400[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_NominalLogit_n400, file = paste0("MonteCarloStudy_NominalLogit_n400.rds"))
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########              Scenario: ZINB               ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,0:(max(y)+1))
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  phi = true_params$phi
+  lambda = true_params$lambda
+  beta = true_params$beta*true_gamma
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    y = ifelse(runif(n) < phi, 0, rnbinom(n, size = lambda, mu = exp(X%*%beta_gamma)))
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_ZINB_n",n,"_",replica_id,".rds"))
+  
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 800 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(phi = 0.2, lambda = 4, beta = c(1, 0.9, -0.65, 0.65, -0.5, 0.5))
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2269) #n=200
+} else if(n == 400){
+  set.seed(4269) #n=400
+} else{
+  set.seed(8269) #n=800
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 1:n_MC,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+Model_Selection = matrix(0, nrow = 32, ncol = n_MC)
+colnames(Model_Selection) = paste0("replica",1:n_MC)
+gamma_char = apply(true_gamma, 2, paste0, collapse = "") #collapsed (label)
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = gamma_char
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+    
+    gamma_sim_repi_modelj = MonteCarloStudy[[i]]$model_selection[,,j] #ith replica, jth model, gamma results
+    gamma_aux = apply(gamma_sim_repi_modelj, 2, paste0, collapse = "")
+    Model_Selection[j,i] = names(sort(table(gamma_aux)/8000, decreasing = TRUE))[1] #Name of most likely model
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+data.frame(true_model = apply(true_gamma, 2, paste0, collapse = ""), Freq = rowSums(Model_Selection == apply(true_gamma, 2, paste0, collapse = ""))/n_MC)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_ZINB_n800 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/ZINB/MonteCarloStudy_ZINB_n800_",i,".rds")
+  MonteCarloStudy_ZINB_n800[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_ZINB_n800[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_ZINB_n800, file = paste0("MonteCarloStudy_ZINB_n800.rds"))
+
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########              Scenario: POISSON            ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,0:(max(y)+1))
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: list of the true parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  beta = true_params$beta*true_gamma
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    y = rpois(n, exp(X%*%beta_gamma))
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_Poisson_n",n,"_",replica_id,".rds"))
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 800 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta = c(1, 0.9, -0.65, 0.65, -0.5, 0.5))
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2161)
+}else if(n == 400){
+  set.seed(4161)
+}else{
+  set.seed(8161)
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create the clusters
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objets
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 1:n_MC,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+gamma_char = apply(true_gamma, 2, paste0, collapse = "") #collapsed (label)
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = gamma_char
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_Poisson_n800 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/Poisson/MonteCarloStudy_Poisson_n800_",i,".rds")
+  MonteCarloStudy_Poisson_n800[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_Poisson_n800[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_Poisson_n800, file = paste0("MonteCarloStudy_Poisson_n800.rds"))
+
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########              Scenario: GAUSSIAN           ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+###### Discrete_BNPMS algorithm
+Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
+  
+  #thresholds
+  a = c(-Inf,0:(max(y)+1))
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  ess = n_iter-n_burn
+  gamma_sim = matrix(0, ncol = ess, nrow = p) #[Covariate, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  for(t in 1:n_burn){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+  }
+  
+  for(t in 1:ess){
+    
+    #Label and latent variables
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    gamma_sim[,t] = gamma
+    
+  }
+  
+  return(gamma_sim)
+  
+}
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx32 matrix with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
+                                prior_params, n_iter, n_burn){
+  
+  beta1 = true_params$beta1*true_gamma
+  sd1= true_params$sd1
+  beta2 = true_params$beta2*true_gamma
+  sd2 = true_params$sd2
+  phi = true_params$phi
+  
+  model_selection = array(0,dim = c(6,n_iter-n_burn,32))
+  dimnames(model_selection) = list(NULL,NULL,apply(true_gamma, 2, paste0, collapse = ""))
+  for(j in 1:32){
+    #seed
+    set.seed(seeds[replica_id,j])
+    
+    #data
+    beta1_gamma = beta1[,j]
+    beta2_gamma = beta2[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    z = ifelse(runif(n) < phi, rnorm(n, X%*%beta1_gamma, sd1), rnorm(n, X%*%beta2_gamma, sd2))
+    y = ifelse(z <= 0, 0, ceiling(z))
+    
+    #model fit
+    prior_params$beta0 = c(mean(y), rep(0,5))
+    model_selection[,,j] = Discrete_BNPMS(y = y, X = X, prior_params,
+                                          n_iter = n_iter, n_burn = n_burn) #6x8000 matrix
+    
+    
+  }
+  
+  saveRDS(model_selection, file = paste0("MonteCarloStudy_Gaussian_n",n,"_",replica_id,".rds"))
+  
+  return(list(replica = replica_id, model_selection = model_selection))
+}
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 800 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta1 = c(33, 6, 1, -1, 4, -4),
+                   beta2 = c(38, 6, 1, -1, 4, -4),
+                   sd1 = sqrt(3), sd2 = sqrt(3), phi = 0.7)
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
+n_iter = 10000 #Length of chains
+n_burn = 2000 #burn-in period
+if(n == 200){
+  set.seed(2712) #n=200
+} else if(n == 400){
+  set.seed(4712) #n=400
+} else{
+  set.seed(8712) #n=800
+}
+seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+
+
+##### Clusters setup for parallel processing
+n_cores = detectCores() #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(Rcpp)
+  library(RcppArmadillo)
+  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
+                               "seeds", "n", "true_params", "true_gamma", "prior_params",
+                               "n_iter", "n_burn"))
+
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy = parLapply(clu, X = 1:100,
+                            fun = function(i) MonteCarloSimulation(i, seeds, n,
+                                                                   true_params, true_gamma, prior_params,
+                                                                   n_iter, n_burn)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+#Processing results
+gamma_char = apply(true_gamma, 2, paste0, collapse = "") #collapsed (label)
+model_probabilities_mean = matrix(0, nrow = 32, ncol = 32)
+bar = txtProgressBar(min = 0, max = n_MC, style = 3) #Progress bar
+for(i in 1:n_MC){
+  
+  #posterior probabilities under each model
+  gamma_posterior_distributions = matrix(0,nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = gamma_char
+  for(j in 1:32){
+    gamma_aux = apply(MonteCarloStudy[[i]]$model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 2000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+    
+    #gamma_sim_repi_modelj = MonteCarloStudy[[i]]$model_selection[,,j] #ith replica, jth model, gamma results
+    #gamma_aux = apply(gamma_sim_repi_modelj, 2, paste0, collapse = "")
+    #Model_Selection[j,i] = names(sort(table(gamma_aux)/8000, decreasing = TRUE))[1] #Name of most likely model
+  }
+  model_probabilities_mean = model_probabilities_mean + gamma_posterior_distributions/n_MC
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+fields::image.plot(1:32, 1:32, t(model_probabilities_mean), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = gamma_char, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+rm(list = ls());gc()
+#Each replicate was saving separately. Here we join them for each sample size.
+models_aux = t(cbind(1, expand.grid(rep(list(c(0, 1)), 5)))) #All possible models
+models_true = models_aux[, order(colSums(models_aux))] #ordening by complexity
+all_gamma_strings = apply(models_true, 2, paste0, collapse = "") #collapsed (label)
+MonteCarloStudy_Gaussian_n800 = vector("list", 100)
+bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
+for(i in 1:100){
+  
+  #gamma simulation under each model
+  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/Gaussian/MonteCarloStudy_Gaussian_n800_",i,".rds")
+  MonteCarloStudy_Gaussian_n800[[i]]$model_selection = model_selection = readRDS(file_route)
+  
+  #Object to save the distribution of gamma
+  gamma_posterior_distributions = matrix(0, nrow = 32, ncol = 32)
+  colnames(gamma_posterior_distributions) = rownames(gamma_posterior_distributions) = all_gamma_strings
+  
+  #posterior probabilities under each model
+  for(j in 1:32){
+    gamma_aux = apply(model_selection[,,j], 2, paste0, collapse = "") #transformation of gamma_sim to a 6000x1 vector
+    prob_gamma = as.numeric(table(gamma_aux))/length(gamma_aux) #Model probabilities
+    names(prob_gamma) = names(table(gamma_aux))
+    gamma_posterior_distributions[j,names(prob_gamma)] = t(prob_gamma) #32x1 vector of model posterior probabilities under model j
+  }
+  
+  
+  MonteCarloStudy_Gaussian_n800[[i]]$gamma_posterior_distributions = gamma_posterior_distributions
+  
+  setTxtProgressBar(bar, i)
+}
+close(bar)
+
+saveRDS(MonteCarloStudy_Gaussian_n800, file = paste0("MonteCarloStudy_Gaussian_n800.rds"))
+
+
+
+### FIN.
