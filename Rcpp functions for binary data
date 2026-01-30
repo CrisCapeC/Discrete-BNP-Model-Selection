@@ -1,0 +1,314 @@
+#include <RcppArmadillo.h>
+// [[Rcpp::depends(RcppArmadillo)]]
+using namespace Rcpp;
+using namespace arma;
+
+
+/////////////////////////////// GAMMA ////////////////////////////////////////
+
+// [[Rcpp::export]]
+List gamma_simulationCPP(arma::ivec gamma, int p, int q, arma::mat X, arma::ivec s, arma::vec z,
+                         int k, arma::ivec n_groups, arma::vec beta0, double kappa, NumericVector prior_gamma){
+  
+  // Global objects (gamma and beta)
+  arma::ivec gamma_new = gamma;
+  arma::ivec gamma_old = gamma;
+  int jj = 1 + static_cast<int>(floor(R::runif(0, 1)*(p-1))); //random number on {1,...,p-1}
+  gamma_new[jj] = 1 - gamma_old[jj]; //covariate jj + 1 is added/removed
+  int q_new = arma::sum(gamma_new); //q_new go from 1 to p
+  arma::uvec cols_new = arma::find(gamma_new == 1); //proposal covariates in
+  arma::uvec cols_old = arma::find(gamma_old == 1); //current covariates in
+  arma::vec beta0_new = beta0.elem(cols_new);
+  arma::vec beta0_old = beta0.elem(cols_old);
+  
+  //Marginal log-likelihood per cluster
+  double p_z_new = 0;
+  double p_z_old = 0;
+  for(int h = 1; h <= k; ++h){
+    
+    // Defining cluster data
+    arma::uvec rows = arma::find(s == h); //i such that s == h
+    int n_h = n_groups[h-1]; //amount of data in cluster h
+    arma::mat X_h_gamma_new = X.submat(rows, cols_new);
+    arma::mat XtX_new = X_h_gamma_new.t()*X_h_gamma_new;
+    arma::mat X_h_gamma_old = X.submat(rows, cols_old);
+    arma::mat XtX_old = X_h_gamma_old.t()*X_h_gamma_old;
+    arma::vec z_h = z.elem(rows);
+    
+    //Marginal log-likelihood for gamma new and old
+    arma::mat A_new = arma::eye(q_new, q_new) + kappa*XtX_new; //Matrix to be inverted
+    arma::mat L_new = arma::chol(A_new);
+    arma::mat aux_new = arma::solve(arma::trimatl(L_new.t()), X_h_gamma_new.t(), arma::solve_opts::fast); //Solve t(L)*a = t(X). Output: Inv(t(L))*t(X)
+    aux_new = arma::solve(arma::trimatu(L_new), aux_new, arma::solve_opts::fast); //Solve L*a = Inv(t(L))*t(X). Output: Inv(L)*Inv(t(L))*t(X)
+    arma::mat Sigma_inv_new = arma::eye(n_h, n_h) - kappa*X_h_gamma_new*aux_new; //Sigma matrix of multivariate normal
+    arma::vec resid_h_new = z_h - X_h_gamma_new*beta0_new;
+    p_z_new -= arma::sum(arma::log(L_new.diag())) + 0.5*arma::dot(resid_h_new, Sigma_inv_new*resid_h_new); //Marginal log-likelihood of the cluster h
+    
+    arma::mat A_old = arma::eye(q, q) + kappa*XtX_old;
+    arma::mat L_old = arma::chol(A_old);
+    arma::mat aux_old = arma::solve(arma::trimatl(L_old.t()), X_h_gamma_old.t(), arma::solve_opts::fast);
+    aux_old = arma::solve(arma::trimatu(L_old), aux_old, arma::solve_opts::fast);
+    arma::mat Sigma_inv_old = arma::eye(n_h, n_h) - kappa*X_h_gamma_old*aux_old;
+    arma::vec resid_h_old = z_h - X_h_gamma_old*beta0_old;
+    p_z_old -= arma::sum(arma::log(L_old.diag())) + 0.5*arma::dot(resid_h_old, Sigma_inv_old*resid_h_old);
+  }
+  
+  //MH step
+  double prior_new = prior_gamma[q_new-1]; //log-prior for gamma_new
+  double prior_old = prior_gamma[q-1]; //log-prior for gamma_old
+  double ratio = prior_new + p_z_new - prior_old - p_z_old;
+  if(std::log(R::runif(0, 1)) < ratio){
+    gamma = gamma_new;
+    q = q_new;
+  }else{
+    gamma = gamma_old;
+  }
+  
+  Rcpp::IntegerVector v = Rcpp::wrap(gamma);
+  v.attr("dim") = R_NilValue;
+  
+  return List::create(Named("gamma") = v, Named("q") = q);
+}
+
+
+/////////////////////////////// S AND Z ////////////////////////////////////////
+
+// [[Rcpp::export]]
+arma::mat sherman_morrisonCPP(arma::mat A_inv, arma::vec u, arma::vec v){
+  double den =  1 + arma::as_scalar(v.t()*A_inv*u);
+  arma::mat num =  A_inv*u*v.t()*A_inv;
+  return A_inv - num/den;
+}
+
+// [[Rcpp::export]]
+double safe_sqrtCPP(double x){
+  if(std::isnan(x) || x < 0.0){
+    return 1e-6;
+  }else{
+    return std::sqrt(x);
+  }
+}
+
+// [[Rcpp::export]]
+List s_z_simulationCPP(arma::ivec y, arma::mat X_gamma, arma::ivec s, int k, arma::ivec n_groups,
+                       arma::vec z, int n, NumericVector a, arma::vec beta0_gamma, double kappa,
+                       double alpha, int q){
+  
+  arma::cube M_h_inv(q, q, k, arma::fill::zeros); //[covariate, covariate, cluster]
+  arma::mat pseudo_beta_h(q, k, arma::fill::zeros); //[coefficient, cluster]
+  arma::mat Iq = arma::eye(q, q); //For cholesky descomposition
+  
+  // Pre-allocate to avoid repeated (re)allocation
+  arma::uvec rows;
+  arma::mat X_h;
+  arma::vec z_h;
+  arma::mat L_h;
+  arma::mat aux_h;
+  arma::vec x_i;
+  double z_i;
+  int s_i;
+  double mu_0;
+  double mu_h;
+  double sigma_h;
+  arma::vec log_ps;
+  arma::vec ps;
+  double aux;
+  double upper;
+  double lower;
+  double u;
+  double cum_prob;
+  arma::mat M_h_inv_aux;
+  arma::vec pseudo_beta_h_aux;
+  int n_h;
+  
+  for(int i = 0; i < n; ++i){
+    
+    //Every 50 data point, hyperparameters will be recomputed, removing drag errors.
+    //This step is ignored if there are fewer than 15 observations in front.
+    //Obs: This quantities can be parameters of the function.
+    if((i+1) % 50 == 1 && i + 16 < n){
+      for(int h = 0; h < k; ++h){
+        
+        // Defining cluster data
+        rows = arma::find(s == h+1); //i such that s == cluster h
+        X_h = X_gamma.rows(rows); //Design matrix of cluster h
+        z_h = z.elem(rows); //response observations of cluster h
+        L_h = arma::chol(Iq/kappa + X_h.t()*X_h); 
+        aux_h = arma::solve(arma::trimatl(L_h.t()), Iq, arma::solve_opts::fast); //#Solve t(L)*a = I. Output: Inv(t(L))
+        
+        //Hyperparameters
+        M_h_inv.slice(h) = arma::solve(arma::trimatu(L_h), aux_h, arma::solve_opts::fast); //#Solve L*a = Inv(t(L)). Output: Inv(L)*Inv(t(L)) (inverse of M_h)
+        pseudo_beta_h.col(h) = beta0_gamma/kappa + X_h.t()*z_h;
+      }
+    }
+    
+    //Data points and prior hyperparameters
+    x_i = X_gamma.row(i).t(); //covariates vector of unit i
+    z_i = z[i]; //current response of unit i
+    s_i = s[i]; //current cluster of unit i
+    mu_0 = arma::dot(x_i, beta0_gamma); //prior mean of z[i]
+    
+    
+    //Labels variables
+    log_ps = arma::vec(k+1); //Cluster probabilities (k + empty one)
+    log_ps.fill(-arma::datum::inf); //fill log_ps with -inf
+    upper = R::pnorm(a[y[i]+1], mu_0, 1, 1, 0); //P(Z_i < a_{y_i + 1})
+    lower = R::pnorm(a[y[i]], mu_0, 1, 1, 0); //P(Z_i < a_{y_i})
+    aux = std::log(upper - lower);
+    log_ps[k] = std::log(alpha) - std::log(alpha+n-1) + aux; //New cluster probability
+    
+    //Cluster probabilities and Removing of data point i from its cluster
+    for(int h = 0; h < k; ++h){
+      
+      if(h != s_i-1){ //if h is not the current cluster
+        mu_h = arma::dot(x_i, M_h_inv.slice(h)*pseudo_beta_h.col(h));
+        sigma_h = safe_sqrtCPP(1 + arma::dot(x_i, M_h_inv.slice(h)*x_i));
+        upper = R::pnorm(a[y[i]+1], mu_h, sigma_h, 1, 0); //P(Z_i < a_{y_i + 1})
+        lower = R::pnorm(a[y[i]], mu_h, sigma_h, 1, 0); //P(Z_i < a_{y_i})
+        aux = std::log(upper - lower);
+        if(!std::isnan(aux)){
+          log_ps[h] = std::log(n_groups[h]) - std::log(alpha+n-1) + aux; //Probability of cluster h
+        }
+      }else{ //We are in the current cluster.
+        if(n_groups[h] > 1){ //there is more data in the cluster => remove the info.
+          M_h_inv.slice(h) = sherman_morrisonCPP(M_h_inv.slice(h), -x_i, x_i);
+          pseudo_beta_h.col(h) += -z_i*x_i;
+          mu_h = arma::dot(x_i, M_h_inv.slice(h)*pseudo_beta_h.col(h));
+          sigma_h = safe_sqrtCPP(1 + arma::dot(x_i, M_h_inv.slice(h)*x_i));
+          upper = R::pnorm(a[y[i]+1], mu_h, sigma_h, 1, 0); //P(Z_i < a_{y_i + 1})
+          lower = R::pnorm(a[y[i]], mu_h, sigma_h, 1, 0); //P(Z_i < a_{y_i})
+          aux = std::log(upper - lower);
+          if(!std::isnan(aux)){
+            log_ps[h] = std::log(n_groups[h]-1) - std::log(alpha+n-1) + aux; //Probability of cluster h
+          }
+        }
+      }
+    }
+    //Sampling s[i]
+    ps = arma::exp(log_ps - log_ps.max());
+    u = R::runif(0, arma::accu(ps));
+    cum_prob = 0.0;
+    for (int j = 0; j < k+1; ++j){
+      cum_prob += ps[j];
+      if (u < cum_prob) {
+        s[i] = j + 1; //s_i will be between 1 and k+1
+        break;
+      }
+    }
+    
+    //Now, we must to updated the objects. The info will not be added yet.
+    if(n_groups[s_i-1] == 1){
+      //Cluster does not keep data. It must be removed. (case 1)
+      s.elem(arma::find(s > s_i)) -= 1; //relabeling
+      n_groups.shed_row(s_i-1); //remove i from n_groups
+      if(s[i] == k){
+        //From an empty cluster to another empty one (case 1.1)
+        M_h_inv.shed_slice(s_i-1);
+        M_h_inv_aux = arma::mat(q, q, arma::fill::zeros);
+        M_h_inv.insert_slices(M_h_inv.n_slices, M_h_inv_aux); 
+        pseudo_beta_h.shed_col(s_i-1);
+        pseudo_beta_h_aux = arma::vec(q, arma::fill::zeros);
+        pseudo_beta_h.insert_cols(pseudo_beta_h.n_cols, pseudo_beta_h_aux);
+        n_groups.insert_rows(n_groups.n_rows, arma::ivec({1}));
+        //The objects have the same dimensions, but the empty cluster is now the last one.
+        
+      }else{
+        //From an empty cluster to a shared one (case 1.2)
+        M_h_inv.shed_slice(s_i-1);
+        pseudo_beta_h.shed_col(s_i-1);
+        ++n_groups[s[i] - 1];
+        //The objects have one less dimension and the cluster s[i] has one more data point (n_h = n_h + 1)
+      }
+    }else{
+      //Cluster keeps data. (case 2)
+      //No cluster should be removed: A new dimension is opened, or everything stays equal.
+      --n_groups[s_i-1]; //remove i from its old cluster
+      if(s[i] == k+1){ //From a shared cluster to an empty one (case 2.1)
+        M_h_inv_aux = arma::mat(q, q, arma::fill::zeros);
+        M_h_inv.insert_slices(M_h_inv.n_slices, M_h_inv_aux); 
+        pseudo_beta_h_aux = arma::vec(q, arma::fill::zeros);
+        pseudo_beta_h.insert_cols(pseudo_beta_h.n_cols, pseudo_beta_h_aux);
+        n_groups.insert_rows(n_groups.n_rows, arma::ivec({1}));
+        //The objects has a new dimension. From k to k+1.
+      }else{ //From a shared cluster to another one. (case 2.2)
+        ++n_groups[s[i]-1]; //add i to its new cluster
+      }
+    }
+    k = s.max();
+    //n_groups is actualized.
+    
+    //Latent variables
+    int h = s[i]-1; //Current cluster
+    n_h = n_groups[h] - 1; //Amount of data (less i data point)
+    if(y[i] == 0){
+      if(n_h > 0){ //The cluster has more data
+        mu_h = arma::dot(x_i, M_h_inv.slice(h)*pseudo_beta_h.col(h));
+        sigma_h = safe_sqrtCPP(1 + arma::dot(x_i, M_h_inv.slice(h)*x_i));
+        upper = std::min(R::pnorm(a[1], mu_h, sigma_h, 1, 0), 1 - 1e-10);
+        lower = 0.0;
+        if(upper > lower){
+          u = R::runif(lower, upper);
+          z[i] = R::qnorm(u,mu_h, sigma_h, 1, 0);
+        }else{
+          z[i] = R::runif(-1,0);
+        }
+      }else{ //i is in a own cluster => define with z[i] information
+        upper = std::min(R::pnorm(a[1], mu_0, 1, 1, 0), 1 - 1e-10);
+        lower = 0.0;
+        if(upper > lower){
+          u = R::runif(lower, upper);
+          z[i] = R::qnorm(u, mu_0, 1, 1, 0);
+        }else{
+          z[i] = R::runif(-1, 0);
+        }
+      }
+    }else{
+      if(n_h > 0){ //The cluster has more data
+        mu_h = arma::dot(x_i, M_h_inv.slice(h)*pseudo_beta_h.col(h));
+        sigma_h = safe_sqrtCPP(1 + arma::dot(x_i, M_h_inv.slice(h)*x_i));
+        upper = std::min(R::pnorm(a[y[i]+1], mu_h, sigma_h, 1, 0), 1 - 1e-10);
+        lower = std::min(R::pnorm(a[y[i]], mu_h, sigma_h, 1, 0), 1 - 1e-10);
+        if(upper > lower){
+          u = R::runif(lower, upper);
+          z[i] = R::qnorm(u, mu_h, sigma_h, 1, 0);
+        }else{
+          z[i] = R::runif(a[y[i]+1], a[y[i]]);
+        }
+      }else{ //i is in a own cluster => define with z[i] information
+        upper = std::min(R::pnorm(a[y[i]+1], mu_0, 1, 1, 0), 1 - 1e-10);
+        lower = std::min(R::pnorm(a[y[i]], mu_0, 1, 1, 0), 1 - 1e-10);
+        if(upper > lower){
+          u = R::runif(lower, upper);
+          z[i] = R::qnorm(u, mu_0, 1, 1, 0);
+        }else{
+          z[i] = R::runif(a[y[i]+1], a[y[i]]);
+        }
+      }
+    }
+    
+    
+    //s and z was already updated
+    
+    //Adding the new data to its cluster
+    if(n_h == 0){ //i is in a own cluster => define cluster with i information (cases 1.1 and 2.1)
+      L_h = arma::chol(Iq/kappa + x_i*x_i.t());
+      aux_h = arma::solve(arma::trimatl(L_h.t()), Iq, arma::solve_opts::fast); //Solve t(L)*a = I. Output: Inv(t(L))
+      M_h_inv.slice(h) = arma::solve(arma::trimatu(L_h), aux_h, arma::solve_opts::fast); //Solve L*a = Inv(t(L)). Output: Inv(L)*Inv(t(L))
+      pseudo_beta_h.col(h) = beta0_gamma/kappa + z[i]*x_i;
+    }else{ //i is in a shared cluster => add i information to the cluster (cases 1.2 and 2.2)
+      M_h_inv.slice(h) = sherman_morrisonCPP(M_h_inv.slice(h), x_i, x_i);
+      pseudo_beta_h.col(h) += z[i]*x_i;
+    }
+  }
+  
+  Rcpp::IntegerVector s_aux = Rcpp::wrap(s);
+  s_aux.attr("dim") = R_NilValue;
+  
+  Rcpp::NumericVector z_aux = Rcpp::wrap(z);
+  z_aux.attr("dim") = R_NilValue;
+  
+  Rcpp::IntegerVector v = Rcpp::wrap(n_groups);
+  v.attr("dim") = R_NilValue;
+  
+  return List::create(Named("s") = s_aux, Named("z") = z_aux, Named("n_groups") = v, Named("k") = k);
+}
