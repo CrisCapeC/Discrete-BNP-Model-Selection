@@ -1,0 +1,860 @@
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########            Scenarios: LOG and CLL         ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+##### Simulation function (ZINB)
+#replica_id = 1:n_MC
+#seeds: n_MCx1 vector with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds_logit, seeds_cloglog, n, true_params_logit, true_params_cloglog, true_gamma){
+  
+  k = 2 #AIC (2) or BIC (log(n))
+  covariates = c("(Intercept)","X1", "X2", "X3", "X4","X5")
+  
+  beta_logit = true_params_logit$beta*true_gamma
+  
+  selection_log_logit = selection_cll_logit = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds_logit[replica_id,j]) #reproducibility
+    #data
+    beta_gamma = beta_logit[,j]
+    X1 = runif(n)
+    X2 = rnorm(n,0.5,0.5)
+    X3 = rgamma(n,1,2)
+    X4 = rbinom(n,1,0.5)
+    X5 = rbinom(n,1,0.75)
+    X = cbind(1,X1,X2,X3,X4,X5)
+    y = rbinom(n, 1, 1/(1 + exp(-X%*%beta_gamma)))
+    
+    #model fit
+    m_log = glm(y ~ X1 + X2 + X3 + X4 + X5, family = binomial(link = "logit"))
+    
+    var_select_log = names(MASS::stepAIC(m_log, direction = "both", trace = 0, k = k)$coef)
+    
+    selection_log_logit[,j] = as.integer(covariates %in% var_select_log)
+    
+  }
+  
+  beta_cloglog = true_params_cloglog$beta*true_gamma
+  
+  selection_log_cloglog = selection_cll_cloglog = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds_cloglog[replica_id,j]) #reproducibility
+    #data
+    beta_gamma = beta_cloglog[,j]
+    X1 = runif(n)
+    X2 = rnorm(n,0.5,0.5)
+    X3 = rgamma(n,1,2)
+    X4 = rbinom(n,1,0.5)
+    X5 = rbinom(n,1,0.75)
+    X = cbind(1,X1,X2,X3,X4,X5)
+    y = rbinom(n,1, 1 - exp(-exp(X%*%beta_gamma)))
+    
+    #model fit
+    m_cll = glm(y ~ X1 + X2 + X3 + X4 + X5, family = binomial(link = "cloglog"))
+    
+    var_select_cll = names(MASS::stepAIC(m_cll, direction = "both", trace = 0, k = k)$coef)
+    
+    selection_cll_cloglog[,j] = as.integer(covariates %in% var_select_cll)
+    
+  }
+  
+  return(list(replica = replica_id,
+              selection_log_logit = selection_log_logit,
+              selection_cll_cloglog = selection_cll_cloglog))
+}
+
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 200 #Datasize
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params_logit = list(beta = c(-1, -2, 1.5, -1.5, 1.2, -1.2))
+true_params_cloglog = list(beta = c(-1, -2, 1.5, -1.5, 1.2, -1.2))
+if(n == 200){
+  set.seed(2121)
+  seeds_logit = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(2312)
+  seeds_cloglog = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else if(n == 400){
+  set.seed(4121)
+  seeds_logit = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(4312)
+  seeds_cloglog = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else{
+  set.seed(8121)
+  seeds_logit = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(8312)
+  seeds_cloglog = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+}
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(MASS)
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation",
+                               "seeds_logit", "seeds_cloglog", "n",
+                               "true_params_logit", "true_params_cloglog",
+                               "true_gamma"))
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
+                            fun = function(i) MonteCarloSimulation(i, seeds_logit, seeds_cloglog, n,
+                                                                   true_params_logit, true_params_cloglog, true_gamma)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+### Analysis of results
+selection_log_logit = selection_cll_cloglog = matrix(0, nrow = 32, ncol = 100)
+for(i in 1:n_MC){
+  selection_log_logit[,i] = apply(MonteCarloStudy_freq[[i]]$selection_log_logit, 2, paste0, collapse = "")
+  selection_cll_cloglog[,i] = apply(MonteCarloStudy_freq[[i]]$selection_cll_cloglog, 2, paste0, collapse = "")
+}
+
+expand_gamma = apply(true_gamma, 2, paste0, collapse = "")
+summary_matrix_log_logit = matrix(0, nrow = 32, ncol = 32)
+summary_matrix_cll_cloglog = matrix(0, nrow = 32, ncol = 32)
+rownames(summary_matrix_log_logit) = colnames(summary_matrix_log_logit) = expand_gamma
+rownames(summary_matrix_cll_cloglog) = colnames(summary_matrix_cll_cloglog) = expand_gamma
+
+for(i in 1:32){
+  for(j in 1:32){
+    summary_matrix_log_logit[i,j] = sum(selection_log_logit[i,] == expand_gamma[j])/100
+    summary_matrix_cll_cloglog[i,j] = sum(selection_cll_cloglog[i,] == expand_gamma[j])/100
+  }
+}
+
+
+fields::image.plot(1:32, 1:32, t(summary_matrix_log_logit), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "Freq_Logit_n800 (UNDER CLL)",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+Freq_Binary = list(LOGmodel_LOGfit = t(summary_matrix_log_logit),
+                        CLLmodel_CLLfit = t(summary_matrix_cll_cloglog))
+
+saveRDS(Freq_Binary, file = "AIC_Binary_n200.rds")
+
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########     Scenario: MultiLOG and MultiCLL       ##########
+############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx1 vector with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds_logit, seeds_cloglog, n, true_params_logit, true_params_cloglog, true_gamma){
+  
+  
+  covariates = c("y","X2", "X3", "X4", "X5","X6")
+  k = log(n) #AIC (2) or BIC (log(n))
+  
+  beta_logit = true_params_logit$beta*true_gamma
+  
+  selection_log_logit = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds_logit[replica_id,j])  #reproducibility
+    #data
+    beta_gamma = beta_logit[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    z = rlogis(n, X%*%beta_gamma, 1)
+    y = cut(z, breaks = c(-Inf, 0, 1, 2, Inf), labels = FALSE)
+    MLOG = data.frame(y,X)
+    
+    #model fit
+    m_multilog = clm(as.factor(y) ~ X2 + X3 + X4 + X5 + X6, data = MLOG, link = "logit")
+    
+    final_formula_log = formula(MASS::stepAIC(m_multilog, direction = "both", trace = FALSE, k = k))
+    var_select_multilog = all.vars(final_formula_log)
+    selection_log_logit[,j] = as.integer(covariates %in% var_select_multilog)
+    
+  }
+  
+  
+  beta_cloglog = true_params_cloglog$beta*true_gamma
+  
+  selection_cll_cloglog = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds_cloglog[replica_id,j])  #reproducibility
+    #data
+    beta_gamma = beta_cloglog[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    z = X%*%beta_gamma + log(-log(1 - runif(n)))
+    y = cut(z, breaks = c(-Inf, 0, 1, 2, Inf), labels = FALSE)
+    MCLL = data.frame(y,X)
+    
+    #model fit
+    m_multicll = clm(as.factor(y) ~ X2 + X3 + X4 + X5 + X6, data = MCLL, link = "cloglog")
+    
+    final_formula_cll = formula(MASS::stepAIC(m_multicll, direction = "both", trace = FALSE, k = k))
+    var_select_multicll = all.vars(final_formula_cll)
+    selection_cll_cloglog[,j] = as.integer(covariates %in% var_select_multicll)
+    
+  }
+  
+  return(list(replica = replica_id,
+              selection_log_logit = selection_log_logit,
+              selection_cll_cloglog = selection_cll_cloglog))
+}
+
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 400 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params_logit = list(beta = c(1, 1.2, -0.7, 0.7, -1.1, 1.1))
+true_params_cloglog = list(beta = c(1, 1.2, -0.7, 0.7, -1.1, 1.1))
+if(n == 200){
+  set.seed(2131)
+  seeds_logit = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(2133)
+  seeds_cloglog = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else if(n == 400){
+  set.seed(4131)
+  seeds_logit = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(4133)
+  seeds_cloglog = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else{
+  set.seed(8131)
+  seeds_logit = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(8133)
+  seeds_cloglog = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+}
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(MASS)
+  library(ordinal)
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation",
+                               "seeds_logit", "seeds_cloglog", "n",
+                               "true_params_logit", "true_params_cloglog",
+                               "true_gamma"))
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
+                                 fun = function(i) MonteCarloSimulation(i, seeds_logit, seeds_cloglog, n,
+                                                                        true_params_logit, true_params_cloglog, true_gamma)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+### Analysis of results
+selection_log_logit = selection_cll_cloglog = matrix(0, nrow = 32, ncol = 100)
+for(i in 1:n_MC){
+  selection_log_logit[,i] = apply(MonteCarloStudy_freq[[i]]$selection_log_logit, 2, paste0, collapse = "")
+  selection_cll_cloglog[,i] = apply(MonteCarloStudy_freq[[i]]$selection_cll_cloglog, 2, paste0, collapse = "")
+}
+
+expand_gamma = apply(true_gamma, 2, paste0, collapse = "")
+summary_matrix_log_logit = summary_matrix_cll_cloglog = matrix(0, nrow = 32, ncol = 32)
+rownames(summary_matrix_log_logit) = colnames(summary_matrix_log_logit) = expand_gamma
+rownames(summary_matrix_cll_cloglog) = colnames(summary_matrix_cll_cloglog) = expand_gamma
+
+for(i in 1:32){
+  for(j in 1:32){
+    summary_matrix_log_logit[i,j] = sum(selection_log_logit[i,] == expand_gamma[j])/100
+    summary_matrix_cll_cloglog[i,j] = sum(selection_cll_cloglog[i,] == expand_gamma[j])/100
+  }
+}
+
+fields::image.plot(1:32, 1:32, t(summary_matrix_log_logit), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "Logit data",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+Freq_Ordinal = list(MLOGmodel_MLOGfit = t(summary_matrix_log_logit),
+                    MCLLmodel_MCLLfit = t(summary_matrix_cll_cloglog))
+
+saveRDS(Freq_Ordinal, file = "BIC_Ordinal_n400.rds")
+
+
+################################################################
+######### Monte Carlo Study for Discrete BNPMS model ##########
+#########        Scenario: Nominal Logit            ##########
+#############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+##### Simulation function (ZINB)
+#replica_id = 1:n_MC
+#seeds: n_MCx1 vector with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma){
+  
+  k = 2 #AIC (2) or BIC (log(n))
+  
+  covariates = c("y","X1", "X2", "X3", "X4","X5")
+  
+  beta1 = true_params$beta1*true_gamma
+  beta2 = true_params$beta2*true_gamma
+  beta3 = true_params$beta3*true_gamma
+  beta4 = true_params$beta4*true_gamma
+  
+  selection_log = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds[replica_id,j])  #reproducibility
+    #data
+    X1 = runif(n)
+    X2 = rnorm(n,0.5,0.5)
+    X3 = rgamma(n,1,2)
+    X4 = rbinom(n,1,0.5)
+    X5 = rbinom(n,1,0.75)
+    X = cbind(1,X1,X2,X3,X4,X5)
+    
+    exp1 = exp(X%*%beta1[,j])
+    exp2 = exp(X%*%beta2[,j])
+    exp3 = exp(X%*%beta3[,j])
+    
+    denom = 1 + exp1 + exp2 + exp3
+    p1 = exp1/denom
+    p2 = exp2/denom
+    p3 = exp3/denom
+    u = runif(n)
+    y = ifelse(u<p1,1,ifelse(u<p1+p2,2,ifelse(u<p1+p2+p3,3,4)))
+
+    #model fit
+    m_multilog = nnet::multinom(y ~ X1 + X2 + X3 + X4 + X5, model=T)
+    final_formula = formula(MASS::stepAIC(m_multilog, direction = "both", trace = FALSE, k = k))
+    var_select_multilog = all.vars(final_formula)
+    selection_log[,j] = as.integer(covariates %in% var_select_multilog)
+    
+  }
+  
+  return(list(replica = replica_id, selection_log = selection_log))
+}
+
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 200 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params = list(beta1 = c(1.4, -2, 1, 1, -1, -3),
+                   beta2 = c(1.1, -2, 1, -2, 1, -3),
+                   beta3 = c(0.7, 1.4, 1.8, 0.2, 0.5, -2))
+if(n == 200){
+  set.seed(2141)
+  seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else if(n == 400){
+  set.seed(4141)
+  seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else{
+  set.seed(8141)
+  seeds = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+}
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(MASS)
+  library(nnet)
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "seeds", "n",
+                               "true_params", "true_gamma"))
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
+                                 fun = function(i) MonteCarloSimulation(i, seeds, n, true_params, true_gamma)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster
+
+
+### Analysis of results
+selection_log = matrix(0, nrow = 32, ncol = 100)
+for(i in 1:n_MC){
+  selection_log[,i] = apply(MonteCarloStudy_freq[[i]]$selection_log, 2, paste0, collapse = "")
+}
+
+expand_gamma = apply(true_gamma, 2, paste0, collapse = "")
+summary_matrix_log = matrix(0, nrow = 32, ncol = 32)
+rownames(summary_matrix_log) = colnames(summary_matrix_log) = expand_gamma
+
+for(i in 1:32){
+  for(j in 1:32){
+    summary_matrix_log[i,j] = sum(selection_log[i,] == expand_gamma[j])/100
+  }
+}
+
+fields::image.plot(1:32, 1:32, t(summary_matrix_log), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "Freq_NominalLogit_n800",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+
+saveRDS(list(NLOGmodel_NLOGfit = t(summary_matrix_log)), file = "AIC_Nominal_n200.rds")
+
+
+#################################################################
+######### Monte Carlo Study for Discrete BNPMS model  ##########
+#########       Scenario: ZINB, Poisson and RGM      ##########
+##############################################################
+rm(list = ls());gc()
+
+
+######################################################
+###########          Functions         ##############
+####################################################
+
+##### Stepwise function for zero-inflated models
+stepwiseZI = function(formula, data, dist = c("poisson", "negbin"), 
+                      direction = c("both", "forward", "backward"), 
+                      criterion = c("AIC", "BIC"), 
+                      maxit = 100, trace = TRUE) {
+  
+  dist = match.arg(dist)
+  direction = match.arg(direction)
+  criterion = match.arg(criterion)
+  
+  get_criterion = function(model){
+    ifelse(criterion == "AIC", AIC(model), BIC(model))
+  }
+  
+  formula_str = as.character(formula)
+  if(length(formula_str) != 3){
+    stop("Formula must be as the form 'y ~ x1 + x2 | z1 + z2'")
+  }
+  
+  # Split count and zero part
+  parts = strsplit(formula_str[3], "\\|")[[1]] #vector of 2 character class elements (count and zero covariates)
+  if (length(parts) != 2) {
+    stop("Formula must include both part (count and zero) splited by '|'")
+  }
+  
+  count_part = trimws(parts[1])
+  zero_part = trimws(parts[2])
+  
+  #Current model
+  count_terms = attr(terms(as.formula(paste("~", count_part))), "term.labels")
+  zero_terms = attr(terms(as.formula(paste("~", zero_part))), "term.labels")
+  current_formula = as.formula(paste(formula_str[2], "~", count_part, "|", zero_part))
+  current_model = zeroinfl(current_formula, data = data, dist = dist)
+  current_crit = get_criterion(current_model)
+  
+  if(trace){
+    cat("Initial ", criterion, ": ", current_crit, "\n", sep = "")
+    print(current_formula)
+  }
+  
+  improved = TRUE
+  iter = 0
+  
+  while(improved && iter < maxit) {
+    iter = iter + 1
+    improved = FALSE
+    
+    neighbors = list() #Candidates
+    
+    #BACKWARD: Delete a term on count or zero part
+    if(direction %in% c("both", "backward")){
+      
+      #Count
+      if(length(count_terms) >= 1){
+        for(term in count_terms){
+          new_count_terms = count_terms[!count_terms %in% term]
+          new_count = ifelse(length(new_count_terms) == 0, "1",
+                             paste(new_count_terms, collapse = " + "))
+          new_formula = as.formula(paste(formula_str[2], "~", new_count, "|", zero_part))
+          neighbors = c(neighbors, list(new_formula))
+        }
+      }
+      
+      #Zero
+      if(length(zero_terms) >= 1){
+        for(term in zero_terms){
+          new_zero_terms = zero_terms[!zero_terms %in% term]
+          new_zero = ifelse(length(new_zero_terms) == 0, "1",
+                            paste(new_zero_terms, collapse = " + "))
+          new_formula = as.formula(paste(formula_str[2], "~", count_part, "|", new_zero))
+          neighbors = c(neighbors, list(new_formula))
+        }
+      }
+    }
+    
+    #FORWARD: Add a allowed term
+    if(direction %in% c("both", "forward")){
+      all_vars = setdiff(colnames(data), formula_str[2])
+      available_count = setdiff(all_vars, count_terms)
+      available_zero = setdiff(all_vars, zero_terms)
+      
+      for(term in available_count){
+        new_count = paste(c(count_terms, term), collapse = " + ")
+        new_formula = as.formula(paste(formula_str[2], "~", new_count, "|", zero_part))
+        neighbors = c(neighbors, list(new_formula))
+      }
+      for(term in available_zero){
+        new_zero = paste(c(zero_terms, term), collapse = " + ")
+        new_formula = as.formula(paste(formula_str[2], "~", count_part, "|", new_zero))
+        neighbors = c(neighbors, list(new_formula))
+      }
+    }
+    
+    # Evaluate candidates and Select the best
+    best_crit = current_crit
+    best_formula = current_formula
+    best_model = current_model
+    improvement_found = FALSE
+    
+    for(new_formula in neighbors){
+      new_model = try(zeroinfl(new_formula, data = data, dist = dist), silent = TRUE)
+      if(!inherits(new_model, "try-error")){
+        new_crit = get_criterion(new_model)
+        if(new_crit < best_crit){
+          #Update the model
+          best_crit = new_crit
+          best_formula = new_formula
+          best_model = new_model
+          improvement_found = TRUE
+        }
+      }
+    }
+    
+    #If the model changed, update objects
+    if(improvement_found){
+      current_crit = best_crit
+      current_formula = best_formula
+      current_model = best_model
+      improved = TRUE
+      
+      new_parts = strsplit(as.character(current_formula)[3], "\\|")[[1]]
+      count_part = trimws(new_parts[1])
+      zero_part = trimws(new_parts[2])
+      count_terms = attr(terms(as.formula(paste("~", count_part))), "term.labels")
+      zero_terms = attr(terms(as.formula(paste("~", zero_part))), "term.labels")
+      
+      if(trace){
+        cat("Iteration ", iter, ": ", criterion, " = ", current_crit, "\n", sep = "")
+        print(current_formula)
+      }
+    }
+  }
+  
+  if(trace){
+    cat("Final model (", criterion, " = ", current_crit, "):\n", sep = "")
+    print(current_formula)
+  }
+  
+  return(current_model)
+}
+
+
+##### Simulation function
+#replica_id = 1:n_MC
+#seeds: n_MCx1 vector with random seeds (between 1 to 9999)
+#n: Sample size
+#true_params: True parameters for data generation
+#true_gamma: 6x32 matrix with all models
+#n_iter: Length of chains
+#n_burn: burn-in period
+MonteCarloSimulation = function(replica_id, seeds_zinb, seeds_poisson, seeds_gaussian, n,
+                                true_params_zinb, true_params_poisson, true_params_gaussian,
+                                true_gamma){
+  
+  crit = "AIC"
+  k = 2
+  covariates = c("(Intercept)","X2", "X3", "X4", "X5","X6")
+  formula_init_ZI = y ~ X2 + X3 + X4 + X5 + X6 | X2 + X3 + X4 + X5 + X6
+  formula_init = y ~ X2 + X3 + X4 + X5 + X6
+  
+  ###ZINB scenario
+  phi = true_params_zinb$phi
+  lambda = true_params_zinb$lambda
+  beta = true_params_zinb$beta*true_gamma
+  
+  selection_zinb_zinb = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds_zinb[replica_id,j])  #reproducibility
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    y = ifelse(runif(n) < phi, 0, rnbinom(n, size = lambda, mu = exp(X%*%beta_gamma)))
+    ZINB = data.frame(y,X)
+    
+    #model fit
+    zinb_model = stepwiseZI(formula_init_ZI, dist = "negbin", data = ZINB,
+                            direction = "both", criterion = crit, trace = FALSE, maxit = 100)
+    
+    var_select_zinb_count = names(zinb_model$coef$count)
+    var_select_zinb_zero = names(zinb_model$coef$zero)
+    var_select_zinb = union(var_select_zinb_count,var_select_zinb_zero)
+    selection_zinb_zinb[,j] = as.integer(covariates %in% var_select_zinb)
+    
+  }
+  
+  
+  ###Poisson scenario
+  beta = true_params_poisson$beta*true_gamma
+  
+  selection_poisson_poisson = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds_poisson[replica_id,j])  #reproducibility
+    #data
+    beta_gamma = beta[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    y = rpois(n, exp(X%*%beta_gamma))
+    Poisson = data.frame(y,X)
+    
+    #model fit
+    m_poisson = glm(formula_init, family = poisson(link = "log"), data = Poisson)
+    
+    var_select_poisson = names(MASS::stepAIC(m_poisson, direction = "both", trace = 0, k = k)$coef)
+    
+    selection_poisson_poisson[,j] = as.integer(covariates %in% var_select_poisson)
+    
+  }
+  
+  
+  ###Gaussian scenario
+  beta1 = true_params_gaussian$beta1*true_gamma
+  sd1= true_params_gaussian$sd1
+  beta2 = true_params_gaussian$beta2*true_gamma
+  sd2 = true_params_gaussian$sd2
+  phi = true_params_gaussian$phi
+  
+  selection_poisson_gaussian = selection_nb_gaussian = matrix(0, ncol = 32, nrow = 6)
+  for(j in 1:32){
+    set.seed(seeds_gaussian[replica_id,j])  #reproducibility
+    #data
+    beta1_gamma = beta1[,j]
+    beta2_gamma = beta2[,j]
+    X = cbind(1,runif(n),rnorm(n,0.5,0.5),rgamma(n,1,2),rbinom(n,1,0.5),rbinom(n,1,0.75))
+    z = ifelse(runif(n) < phi, rnorm(n, X%*%beta1_gamma, sd1), rnorm(n, X%*%beta2_gamma, sd2))
+    y = ifelse(z <= 0, 0, ceiling(z))
+    Gaussian = data.frame(y,X)
+    
+    #model fit
+    m_poisson = glm(formula_init, family = poisson(link = "log"), data = Gaussian)
+    m_nb = glm.nb(formula_init, link = "log", data = Gaussian)
+    
+    var_select_poisson = names(MASS::stepAIC(m_poisson, direction = "both", trace = 0, k = k)$coef)
+    var_select_nb = names(MASS::stepAIC(m_nb, direction = "both", trace = 0, k = k)$coef)
+    
+    selection_poisson_gaussian[,j] = as.integer(covariates %in% var_select_poisson)
+    selection_nb_gaussian[,j] = as.integer(covariates %in% var_select_nb)
+    
+  }
+  
+  
+  
+  return(list(replica = replica_id,
+              selection_zinb_zinb = selection_zinb_zinb,
+              selection_poisson_poisson = selection_poisson_poisson,
+              selection_poisson_gaussian = selection_poisson_gaussian,
+              selection_nb_gaussian = selection_nb_gaussian))
+}
+
+
+
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
+library(parallel)
+
+##### Simulation setup
+n_MC = 100 #MonteCarlo replicas
+n = 400 #Sample size
+true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
+true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
+true_params_zinb = list(phi = 0.2, lambda = 4, beta = c(1, 0.9, -0.65, 0.65, -0.5, 0.5))
+true_params_poisson = list(beta = c(1, 0.9, -0.65, 0.65, -0.5, 0.5))
+true_params_gaussian = list(beta1 = c(33, 6, 1, -1, 4, -4),
+                            beta2 = c(38, 6, 1, -1, 4, -4),
+                            sd1 = sqrt(3), sd2 = sqrt(3), phi = 0.7)
+if(n == 200){
+  set.seed(2269)
+  seeds_zinb = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(2161)
+  seeds_poisson = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(2712)
+  seeds_gaussian = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else if(n == 400){
+  set.seed(4269)
+  seeds_zinb = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(4161)
+  seeds_poisson = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(4712)
+  seeds_gaussian = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+} else{
+  set.seed(8269)
+  seeds_zinb = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(8161)
+  seeds_poisson = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+  set.seed(8712)
+  seeds_gaussian = matrix(sample(1:9999, n_MC*32, replace = F), nrow = n_MC, ncol = 32)
+}
+
+##### Clusters setup for parallel processing
+n_cores = detectCores()  #Number of cores
+clu = makeCluster(n_cores)  #Create de cluster
+#Including dependences
+clusterEvalQ(clu,{
+  library(MASS)
+  library(pscl)
+})
+#Exporting functions and objects
+clusterExport(clu, varlist = c("MonteCarloSimulation", "stepwiseZI",
+                               "seeds_zinb", "seeds_poisson", "seeds_gaussian", "n",
+                               "true_params_zinb", "true_params_poisson", "true_params_gaussian",
+                               "true_gamma"))
+
+
+##### MonteCarlo study
+library(tictoc)
+tic()
+MonteCarloStudy_freq = parLapply(clu, X = 1:n_MC,
+                                 fun = function(i) MonteCarloSimulation(i, seeds_zinb, seeds_poisson, seeds_gaussian, n,
+                                                                        true_params_zinb, true_params_poisson, true_params_gaussian, true_gamma)
+)
+toc()
+#A list of n_MC objects.
+#Each object is in turn a list with: replica_id, model selection array (p(6), ess(8000), model space size (32))
+stopCluster(clu) #Closing cluster (40 min. with 200 observations using BIC, and 55 min. with AIC)
+# 91min with n = 800 and 49min with n = 400 under AIC;
+
+
+### Analysis of results
+selection_zinb_zinb = selection_zip_zinb = selection_poisson_poisson = selection_nb_poisson = selection_poisson_gaussian = selection_nb_gaussian = matrix(0, nrow = 32, ncol = 100)
+for(i in 1:n_MC){
+  selection_zinb_zinb[,i] = apply(MonteCarloStudy_freq[[i]]$selection_zinb_zinb, 2, paste0, collapse = "")
+  selection_poisson_poisson[,i] = apply(MonteCarloStudy_freq[[i]]$selection_poisson_poisson, 2, paste0, collapse = "")
+  selection_poisson_gaussian[,i] = apply(MonteCarloStudy_freq[[i]]$selection_poisson_gaussian, 2, paste0, collapse = "")
+  selection_nb_gaussian[,i] = apply(MonteCarloStudy_freq[[i]]$selection_nb_gaussian, 2, paste0, collapse = "")
+}
+
+expand_gamma = apply(true_gamma, 2, paste0, collapse = "")
+summary_matrix_zinb_zinb = summary_matrix_poisson_poisson = summary_matrix_poisson_gaussian = summary_matrix_nb_gaussian = matrix(0, nrow = 32, ncol = 32)
+rownames(summary_matrix_zinb_zinb) = rownames(summary_matrix_poisson_poisson) = rownames(summary_matrix_poisson_gaussian) = rownames(summary_matrix_nb_gaussian) = expand_gamma
+colnames(summary_matrix_zinb_zinb) = colnames(summary_matrix_poisson_poisson) = colnames(summary_matrix_poisson_gaussian) = colnames(summary_matrix_nb_gaussian) = expand_gamma
+
+for(i in 1:32){
+  for(j in 1:32){
+    summary_matrix_zinb_zinb[i,j] = sum(selection_zinb_zinb[i,] == expand_gamma[j])/100
+    summary_matrix_poisson_poisson[i,j] = sum(selection_poisson_poisson[i,] == expand_gamma[j])/100
+    summary_matrix_poisson_gaussian[i,j] = sum(selection_poisson_gaussian[i,] == expand_gamma[j])/100
+    summary_matrix_nb_gaussian[i,j] = sum(selection_nb_gaussian[i,] == expand_gamma[j])/100
+  }
+}
+
+
+fields::image.plot(1:32, 1:32, t(summary_matrix_nb_gaussian), col = colorRampPalette(c("white", rgb(0, 0.3, 0.3)))(100),
+                   xlab = "Selected model", ylab = "True model", main = "scenario: zinb, fit: zinb, n = 200",
+                   axes = FALSE, axis.args = list(tck = 0, lwd = 0, mgp = c(1,0.5,0)),
+                   zlim = c(0,1), legend.shrink = 0.6)
+axis(1, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+axis(2, at = 1:32, labels = expand_gamma, las = 2, cex.axis = 0.5, tick = FALSE)
+for(j in 0:32){
+  abline(h = j + 0.5, col = "grey60", lwd = 0.5)
+  abline(v = j + 0.5, col = "grey60", lwd = 0.5)
+}
+
+Freq_Counts = list(ZINBmodel_ZINBfit = t(summary_matrix_zinb_zinb),
+                   POImodel_POIfit = t(summary_matrix_poisson_poisson),
+                   RGMmodel_POIfit = t(summary_matrix_poisson_gaussian),
+                   RGMmodel_NBfit = t(summary_matrix_nb_gaussian))
+
+saveRDS(Freq_Counts, file = "AIC_Counts_n400.rds")
+
+
+
+### FIN.
