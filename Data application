@@ -1,0 +1,1521 @@
+##############################################################
+####             Data: Shill Bidding               ##########
+#### Response: Indicator of fraudulent auctioneer ##########
+###########################################################
+rm(list = ls());gc()
+
+#Dataset reading
+route = file.choose()
+shill_bidding = rio::import(route)
+head(shill_bidding)
+ncol(shill_bidding) #13
+nrow(shill_bidding) #6321
+str(shill_bidding)
+table(shill_bidding$Class)/nrow(shill_bidding)
+df = shill_bidding[,-c(1:3)] #First columns ignored
+
+#Descriptive analysis (runif allows visualization for discrete predictors)
+summary(df)
+plot(df$Bidder_Tendency, df$Class, ylim = c(0,1))
+plot(df$Bidding_Ratio, df$Class, ylim = c(0,1))
+plot(df$Successive_Outbidding, df$Class+runif(nrow(df),-0.03,0.03), ylim = c(0,1)) #3 categories
+plot(df$Last_Bidding, df$Class, ylim = c(0,1))
+plot(df$Auction_Bids, df$Class + runif(nrow(df),-0.03,0.03), ylim = c(0,1))
+plot(df$Starting_Price_Average, df$Class + runif(nrow(df),-0.03,0.03), ylim = c(0,1))
+plot(df$Early_Bidding, df$Class, ylim = c(0,1))
+plot(df$Winning_Ratio, df$Class + runif(nrow(df),-0.03,0.03), ylim = c(0,1))
+plot(df$Auction_Duration, df$Class + runif(nrow(df),-0.03,0.03), ylim = c(0,1))
+
+#VIF
+X_scaled = as.matrix((df[,-10] - colMeans(df[,-10]))/apply(df[,-10], 2, sd))
+(VIF = diag(solve(t(as.matrix(X_scaled))%*%X_scaled)))
+barplot(VIF, ylim = c(0,0.002))
+
+
+#########################################################################
+
+
+#Model fit
+library(Rcpp)
+library(RcppArmadillo)
+sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_BINARY_BNPMS_Neals_approach.cpp")
+
+Discrete_BNPMS = function(y, X, prior_params, n_iter){
+  
+  a = c(-Inf,0,Inf)
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  alpha_sim = numeric(n_iter)
+  gamma_sim = matrix(0, ncol = n_iter, nrow = p) #[Covariate, iteration]
+  s_sim = matrix(1,ncol = n_iter, nrow = n) #[Observation, iteration]
+  z_sim = matrix(0,ncol = n_iter, nrow = n) #[Observation, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor, approximately
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  
+  bar = txtProgressBar(min = 0, max = n_iter, style = 3) #Progress bar
+  for(t in 1:n_iter){
+    
+    #Label and latent (s and z)
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
+                                      prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    s_sim[,t] = s
+    z_sim[,t] = z
+    alpha_sim[t] = alpha
+    gamma_sim[,t] = gamma
+    
+    setTxtProgressBar(bar, t-1)
+  }
+  close(bar)
+  
+  list(s = s_sim, z = z_sim, alpha = alpha_sim, gamma = gamma_sim)
+  
+}
+
+
+#Fitting model
+y = as.vector(df[,10])
+X = as.matrix(cbind(1,df[,-10]))
+prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10,
+                    a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+model = Discrete_BNPMS(y = y, X = X, prior_params, n_iter = 20000)
+
+#saveRDS(list(s = model$s, z = model$z,alpha = model$alpha, gamma = model$gamma), "shill_bidding_fitting.rds")
+
+#########################################################################
+
+
+y = as.vector(df[,10])
+X = as.matrix(cbind(1,df[,-10]))
+colnames(X)[1] = "Intercept"
+prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10,
+                    a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+
+shill_bidding_fitting = readRDS("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Data application/Shill Bidding/shill_bidding_fitting.rds") #List with s, z, alpha and gamma
+s_sim = shill_bidding_fitting$s
+z_sim = shill_bidding_fitting$z
+alpha_sim = shill_bidding_fitting$alpha
+gamma_sim = shill_bidding_fitting$gamma
+rownames(gamma_sim) = colnames(X)
+ts.plot(colSums(gamma_sim))
+
+#Chains settings
+n.burn = 5000
+n.thin = 2
+index.f = seq(n.burn+1, length(alpha_sim), by = n.thin);length(index.f)
+
+
+####### Model selection
+rowMeans(gamma_sim[,index.f]) #Marginal posterior probabilities of variable inclusion
+gamma_aux = apply(gamma_sim[,index.f], 2, paste0, collapse = "")
+prob_gamma = sort(table(gamma_aux)/length(index.f), decreasing = TRUE) #Model probabilities
+prob_gamma[1:3] #Posterior model probabilities
+gamma_MP = as.integer(strsplit(names(prob_gamma)[1], "")[[1]]);gamma_MP #MP Bayes estimator
+names(gamma_MP) = c("Intercept",colnames(df)[-10])
+gamma_MP
+#Bidder tendency; Successive_Outbidding; Winning_Ratio.
+
+
+####### Estimated Mass function as a function of Successive_Outbidding and Winning ratio
+x_0 = colMeans(X[X[,"Successive_Outbidding"] == 0,]) #Predictive covariates
+x_0.5 = colMeans(X[X[,"Successive_Outbidding"] == 0.5,]) #Predictive covariates
+x_1 = colMeans(X[X[,"Successive_Outbidding"] == 1,]) #Predictive covariates
+#for Successive_Outbidding = 0
+x_0_0 = x_0; x_0_0["Winning_Ratio"] = 0
+x_0.3_0 = x_0; x_0.3_0["Winning_Ratio"] = 0.3
+x_0.7_0 = x_0; x_0.7_0["Winning_Ratio"] = 0.7
+x_1_0 = x_0; x_1_0["Winning_Ratio"] = 1
+#for Successive_Outbidding = 0.5
+x_0_0.5 = x_0.5; x_0_0.5["Winning_Ratio"] = 0
+x_0.3_0.5 = x_0.5; x_0.3_0.5["Winning_Ratio"] = 0.3
+x_0.7_0.5 = x_0.5; x_0.7_0.5["Winning_Ratio"] = 0.7
+x_1_0.5 = x_0.5; x_1_0.5["Winning_Ratio"] = 1
+#for Successive_Outbidding = 1
+x_0_1 = x_1; x_0_1["Winning_Ratio"] = 0
+x_0.3_1 = x_1; x_0.3_1["Winning_Ratio"] = 0.3
+x_0.7_1 = x_1; x_0.7_1["Winning_Ratio"] = 0.7
+x_1_1 = x_1; x_1_1["Winning_Ratio"] = 1
+
+#configurations for the use of the most probable model
+coord_model = index.f[which(apply(gamma_sim[,index.f], 2, function(col) all(col == gamma_MP)))];length(coord_model)
+q = sum(gamma_MP)
+beta0_gamma = prior_params$beta0[gamma_MP == 1]
+X_gamma = X[, gamma_MP == 1,drop = F]
+x_0_0_gamma = x_0_0[gamma_MP == 1]
+x_0.3_0_gamma = x_0.3_0[gamma_MP == 1]
+x_0.7_0_gamma = x_0.7_0[gamma_MP == 1]
+x_1_0_gamma = x_1_0[gamma_MP == 1]
+x_0_0.5_gamma = x_0_0.5[gamma_MP == 1]
+x_0.3_0.5_gamma = x_0.3_0.5[gamma_MP == 1]
+x_0.7_0.5_gamma = x_0.7_0.5[gamma_MP == 1]
+x_1_0.5_gamma = x_1_0.5[gamma_MP == 1]
+x_0_1_gamma = x_0_1[gamma_MP == 1]
+x_0.3_1_gamma = x_0.3_1[gamma_MP == 1]
+x_0.7_1_gamma = x_0.7_1[gamma_MP == 1]
+x_1_1_gamma = x_1_1[gamma_MP == 1]
+
+
+#computing predictive function
+a = c(-Inf,0,Inf)
+ypred_0_0 = ypred_0.3_0 = ypred_0.7_0 = ypred_1_0 =
+  ypred_0_0.5 = ypred_0.3_0.5 = ypred_0.7_0.5 = ypred_1_0.5 = 
+  ypred_0_1 = ypred_0.3_1 = ypred_0.7_1 = ypred_1_1 = 
+  matrix(0, nrow = length(a)-1, ncol = length(coord_model)) #[grid, iteration]
+it = 1
+n = length(y)
+for(t in coord_model){
+  s = s_sim[,t]
+  z = z_sim[,t]
+  for(h in 1:max(s)){
+    n_h = sum(s == h)
+    X_h = X_gamma[s == h,,drop = F]
+    z_h = z[s == h]
+    M_h = diag(1/prior_params$kappa, q) + t(X_h)%*%X_h
+    beta_h = solve(M_h)%*%(beta0_gamma/prior_params$kappa + t(X_h)%*%z_h)
+    #SB = 0
+    x0 = x_0_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0_0[,it] = ypred_0_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.3_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.3_0[,it] = ypred_0.3_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.7_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.7_0[,it] = ypred_0.7_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_1_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_1_0[,it] = ypred_1_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    #SB = 0.5
+    x0 = x_0_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0_0.5[,it] = ypred_0_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.3_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.3_0.5[,it] = ypred_0.3_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.7_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.7_0.5[,it] = ypred_0.7_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_1_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_1_0.5[,it] = ypred_1_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    #SB = 1
+    x0 = x_0_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0_1[,it] = ypred_0_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.3_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.3_1[,it] = ypred_0.3_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.7_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.7_1[,it] = ypred_0.7_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_1_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_1_1[,it] = ypred_1_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+  }
+  
+  #SB = 0
+  x0 = x_0_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0_0[,it] = ypred_0_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.3_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.3_0[,it] = ypred_0.3_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.7_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.7_0[,it] = ypred_0.7_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_1_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_1_0[,it] = ypred_1_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  #SB = 0.5
+  x0 = x_0_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0_0.5[,it] = ypred_0_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.3_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.3_0.5[,it] = ypred_0.3_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.7_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.7_0.5[,it] = ypred_0.7_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_1_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_1_0.5[,it] = ypred_1_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  #SB = 1
+  x0 = x_0_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0_1[,it] = ypred_0_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.3_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.3_1[,it] = ypred_0.3_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.7_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.7_1[,it] = ypred_0.7_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_1_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_1_1[,it] = ypred_1_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  
+  it = it + 1
+}
+
+#Average curve
+ypred_mean_0_0 = ypred_mean_0.3_0 = ypred_mean_0.7_0 = ypred_mean_1_0 =
+  ypred_mean_0_0.5 = ypred_mean_0.3_0.5 = ypred_mean_0.7_0.5 = ypred_mean_1_0.5 =
+  ypred_mean_0_1 = ypred_mean_0.3_1 = ypred_mean_0.7_1 = ypred_mean_1_1 =
+  rep(0,length(a)-1)
+for(j in 1:(length(a)-1)){
+  #SB = 0
+  ypred_mean_0_0[j] = mean(ypred_0_0[j,])
+  ypred_mean_0.3_0[j] = mean(ypred_0.3_0[j,])
+  ypred_mean_0.7_0[j] = mean(ypred_0.7_0[j,])
+  ypred_mean_1_0[j] = mean(ypred_1_0[j,])
+  #SB = 0.5
+  ypred_mean_0_0.5[j] = mean(ypred_0_0.5[j,])
+  ypred_mean_0.3_0.5[j] = mean(ypred_0.3_0.5[j,])
+  ypred_mean_0.7_0.5[j] = mean(ypred_0.7_0.5[j,])
+  ypred_mean_1_0.5[j] = mean(ypred_1_0.5[j,])
+  #SB = 1
+  ypred_mean_0_1[j] = mean(ypred_0_1[j,])
+  ypred_mean_0.3_1[j] = mean(ypred_0.3_1[j,])
+  ypred_mean_0.7_1[j] = mean(ypred_0.7_1[j,])
+  ypred_mean_1_1[j] = mean(ypred_1_1[j,])
+}
+
+#Graphics
+par(mfrow = c(1,3))
+#SO = 0
+plot(c(0,1), c(0,1.1), type = "n", xlab = "Fraudulent auctioneer", ylab = "Probability", main = "No outbidding")
+abline(v = seq(0,1,by = 0.1), h = seq(0,1,by = 0.1), col = "grey80")
+lines(0:1, ypred_mean_0_0, type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.3_0, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.7_0, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_1_0, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('WR = 0','WR = 0.3','WR = 0.7','WR = 1'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+#SO = 0.5
+plot(c(0,1), c(0,1.1), type = "n", xlab = "Fraudulent auctioneer", ylab = "Probability", main = "Partial outbidding")
+abline(v = seq(0,1,by = 0.1), h = seq(0,1,by = 0.1), col = "grey80")
+lines(0:1, ypred_mean_0_0.5, type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.3_0.5, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.7_0.5, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_1_0.5, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('WR = 0','WR = 0.3','WR = 0.7','WR = 1'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+#SO = 1
+plot(c(0,1), c(0,1.1), type = "n", xlab = "Fraudulent auctioneer", ylab = "Probability", main = "Successive outbidding")
+abline(v = seq(0,1,by = 0.1), h = seq(0,1,by = 0.1), col = "grey80")
+lines(0:1, ypred_mean_0_1, type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.3_1, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.7_1, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_1_1, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('WR = 0','WR = 0.3','WR = 0.7','WR = 1'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+
+#PDF 10x4
+
+
+
+
+
+####### Estimated Mass function as a function of Successive_Outbidding and Bidder Tendency
+x_0 = colMeans(X[X[,"Successive_Outbidding"] == 0,]) #Predictive covariates
+x_0.5 = colMeans(X[X[,"Successive_Outbidding"] == 0.5,]) #Predictive covariates
+x_1 = colMeans(X[X[,"Successive_Outbidding"] == 1,]) #Predictive covariates
+#for Successive_Outbidding = 0
+x_0_0 = x_0; x_0_0["Bidder_Tendency"] = 0
+x_0.3_0 = x_0; x_0.3_0["Bidder_Tendency"] = 0.3
+x_0.7_0 = x_0; x_0.7_0["Bidder_Tendency"] = 0.7
+x_1_0 = x_0; x_1_0["Bidder_Tendency"] = 1
+#for Successive_Outbidding = 0.5
+x_0_0.5 = x_0.5; x_0_0.5["Bidder_Tendency"] = 0
+x_0.3_0.5 = x_0.5; x_0.3_0.5["Bidder_Tendency"] = 0.3
+x_0.7_0.5 = x_0.5; x_0.7_0.5["Bidder_Tendency"] = 0.7
+x_1_0.5 = x_0.5; x_1_0.5["Bidder_Tendency"] = 1
+#for Successive_Outbidding = 1
+x_0_1 = x_1; x_0_1["Bidder_Tendency"] = 0
+x_0.3_1 = x_1; x_0.3_1["Bidder_Tendency"] = 0.3
+x_0.7_1 = x_1; x_0.7_1["Bidder_Tendency"] = 0.7
+x_1_1 = x_1; x_1_1["Bidder_Tendency"] = 1
+
+#configurations for the use of the most probable model
+coord_model = index.f[which(apply(gamma_sim[,index.f], 2, function(col) all(col == gamma_MP)))];length(coord_model)
+q = sum(gamma_MP)
+beta0_gamma = prior_params$beta0[gamma_MP == 1]
+X_gamma = X[, gamma_MP == 1,drop = F]
+x_0_0_gamma = x_0_0[gamma_MP == 1]
+x_0.3_0_gamma = x_0.3_0[gamma_MP == 1]
+x_0.7_0_gamma = x_0.7_0[gamma_MP == 1]
+x_1_0_gamma = x_1_0[gamma_MP == 1]
+x_0_0.5_gamma = x_0_0.5[gamma_MP == 1]
+x_0.3_0.5_gamma = x_0.3_0.5[gamma_MP == 1]
+x_0.7_0.5_gamma = x_0.7_0.5[gamma_MP == 1]
+x_1_0.5_gamma = x_1_0.5[gamma_MP == 1]
+x_0_1_gamma = x_0_1[gamma_MP == 1]
+x_0.3_1_gamma = x_0.3_1[gamma_MP == 1]
+x_0.7_1_gamma = x_0.7_1[gamma_MP == 1]
+x_1_1_gamma = x_1_1[gamma_MP == 1]
+
+
+#computing predictive function
+a = c(-Inf,0,Inf)
+ypred_0_0 = ypred_0.3_0 = ypred_0.7_0 = ypred_1_0 =
+  ypred_0_0.5 = ypred_0.3_0.5 = ypred_0.7_0.5 = ypred_1_0.5 = 
+  ypred_0_1 = ypred_0.3_1 = ypred_0.7_1 = ypred_1_1 = 
+  matrix(0, nrow = length(a)-1, ncol = length(coord_model)) #[grid, iteration]
+it = 1
+n = length(y)
+for(t in coord_model){
+  s = s_sim[,t]
+  z = z_sim[,t]
+  for(h in 1:max(s)){
+    n_h = sum(s == h)
+    X_h = X_gamma[s == h,,drop = F]
+    z_h = z[s == h]
+    M_h = diag(1/prior_params$kappa, q) + t(X_h)%*%X_h
+    beta_h = solve(M_h)%*%(beta0_gamma/prior_params$kappa + t(X_h)%*%z_h)
+    #SB = 0
+    x0 = x_0_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0_0[,it] = ypred_0_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.3_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.3_0[,it] = ypred_0.3_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.7_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.7_0[,it] = ypred_0.7_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_1_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_1_0[,it] = ypred_1_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    #SB = 0.5
+    x0 = x_0_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0_0.5[,it] = ypred_0_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.3_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.3_0.5[,it] = ypred_0.3_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.7_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.7_0.5[,it] = ypred_0.7_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_1_0.5_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_1_0.5[,it] = ypred_1_0.5[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    #SB = 1
+    x0 = x_0_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0_1[,it] = ypred_0_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.3_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.3_1[,it] = ypred_0.3_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_0.7_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0.7_1[,it] = ypred_0.7_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_1_1_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_1_1[,it] = ypred_1_1[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+  }
+  
+  #SB = 0
+  x0 = x_0_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0_0[,it] = ypred_0_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.3_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.3_0[,it] = ypred_0.3_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.7_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.7_0[,it] = ypred_0.7_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_1_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_1_0[,it] = ypred_1_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  #SB = 0.5
+  x0 = x_0_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0_0.5[,it] = ypred_0_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.3_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.3_0.5[,it] = ypred_0.3_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.7_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.7_0.5[,it] = ypred_0.7_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_1_0.5_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_1_0.5[,it] = ypred_1_0.5[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  #SB = 1
+  x0 = x_0_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0_1[,it] = ypred_0_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.3_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.3_1[,it] = ypred_0.3_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_0.7_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0.7_1[,it] = ypred_0.7_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_1_1_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_1_1[,it] = ypred_1_1[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  
+  it = it + 1
+}
+
+#Average curve
+ypred_mean_0_0 = ypred_mean_0.3_0 = ypred_mean_0.7_0 = ypred_mean_1_0 =
+  ypred_mean_0_0.5 = ypred_mean_0.3_0.5 = ypred_mean_0.7_0.5 = ypred_mean_1_0.5 =
+  ypred_mean_0_1 = ypred_mean_0.3_1 = ypred_mean_0.7_1 = ypred_mean_1_1 =
+  rep(0,length(a)-1)
+for(j in 1:(length(a)-1)){
+  #SB = 0
+  ypred_mean_0_0[j] = mean(ypred_0_0[j,])
+  ypred_mean_0.3_0[j] = mean(ypred_0.3_0[j,])
+  ypred_mean_0.7_0[j] = mean(ypred_0.7_0[j,])
+  ypred_mean_1_0[j] = mean(ypred_1_0[j,])
+  #SB = 0.5
+  ypred_mean_0_0.5[j] = mean(ypred_0_0.5[j,])
+  ypred_mean_0.3_0.5[j] = mean(ypred_0.3_0.5[j,])
+  ypred_mean_0.7_0.5[j] = mean(ypred_0.7_0.5[j,])
+  ypred_mean_1_0.5[j] = mean(ypred_1_0.5[j,])
+  #SB = 1
+  ypred_mean_0_1[j] = mean(ypred_0_1[j,])
+  ypred_mean_0.3_1[j] = mean(ypred_0.3_1[j,])
+  ypred_mean_0.7_1[j] = mean(ypred_0.7_1[j,])
+  ypred_mean_1_1[j] = mean(ypred_1_1[j,])
+}
+
+
+
+#Graphics
+par(mfrow = c(1,3))
+#SO = 0
+plot(c(0,1), c(0,1.1), type = "n", xlab = "Fraudulent auctioneer", ylab = "Probability", main = "No outbidding")
+abline(v = seq(0,1,by = 0.1), h = seq(0,1,by = 0.1), col = "grey80")
+lines(0:1, ypred_mean_0_0, type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.3_0, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.7_0, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_1_0, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('BT = 0','BT = 0.3','BT = 0.7','BT = 1'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+#SO = 0.5
+plot(c(0,1), c(0,1.1), type = "n", xlab = "Fraudulent auctioneer", ylab = "Probability", main = "Partial outbidding")
+abline(v = seq(0,1,by = 0.1), h = seq(0,1,by = 0.1), col = "grey80")
+lines(0:1, ypred_mean_0_0.5, type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.3_0.5, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.7_0.5, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_1_0.5, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('BT = 0','BT = 0.3','BT = 0.7','BT = 1'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+#SO = 1
+plot(c(0,1), c(0,1.1), type = "n", xlab = "Fraudulent auctioneer", ylab = "Probability", main = "Successive outbidding")
+abline(v = seq(0,1,by = 0.1), h = seq(0,1,by = 0.1), col = "grey80")
+lines(0:1, ypred_mean_0_1, type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.3_1, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_0.7_1, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(0:1, ypred_mean_1_1, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('BT = 0','BT = 0.3','BT = 0.7','BT = 1'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+
+#PDF 10x4
+
+
+###########################################################
+#########            Data: Wine quality         ##########
+######### Response: Score ranging from 1 to 10 ##########
+########################################################
+rm(list = ls());gc()
+
+#Dataset reading
+route = file.choose()
+wine_quality = rio::import(route)
+wine_quality_white = wine_quality[wine_quality$type == "white",-1]
+wine_quality_red = wine_quality[wine_quality$type == "red",-1]
+head(wine_quality)
+ncol(wine_quality) #13
+nrow(wine_quality) #6497
+nrow(wine_quality_white) #4898
+nrow(wine_quality_red) #1599
+
+
+#Descriptive analysis
+plot(c(1,10),c(0,0.5),type = "n")
+lines(prop.table(table(factor(wine_quality_white[,12], levels = 1:10))), type = "o", pch = 16, lwd = 2, col = "grey30")
+lines(prop.table(table(factor(wine_quality_red[,12], levels = 1:10))), type = "o", pch = 16, lwd = 2, col = "darkred")
+
+par(mfrow = c(1,2))
+plot(wine_quality_white[,1],wine_quality_white[,12], xlab = colnames(wine_quality)[2], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,1],wine_quality_red[,12], xlab = colnames(wine_quality)[2], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,2],wine_quality_white[,12], xlab = colnames(wine_quality)[3], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,2],wine_quality_red[,12], xlab = colnames(wine_quality)[3], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,3],wine_quality_white[,12], xlab = colnames(wine_quality)[4], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,4],wine_quality_red[,12], xlab = colnames(wine_quality)[4], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,4],wine_quality_white[,12], xlab = colnames(wine_quality)[5], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,4],wine_quality_red[,12], xlab = colnames(wine_quality)[5], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,5],wine_quality_white[,12], xlab = colnames(wine_quality)[6], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,5],wine_quality_red[,12], xlab = colnames(wine_quality)[6], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,6],wine_quality_white[,12], xlab = colnames(wine_quality)[7], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,6],wine_quality_red[,12], xlab = colnames(wine_quality)[7], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,7],wine_quality_white[,12], xlab = colnames(wine_quality)[8], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,7],wine_quality_red[,12], xlab = colnames(wine_quality)[8], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,8],wine_quality_white[,12], xlab = colnames(wine_quality)[9], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,8],wine_quality_red[,12], xlab = colnames(wine_quality)[9], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,9],wine_quality_white[,12], xlab = colnames(wine_quality)[10], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,9],wine_quality_red[,12], xlab = colnames(wine_quality)[10], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,10],wine_quality_white[,12], xlab = colnames(wine_quality)[11], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,10],wine_quality_red[,12], xlab = colnames(wine_quality)[11], ylab = colnames(wine_quality)[13])
+plot(wine_quality_white[,11],wine_quality_white[,12], xlab = colnames(wine_quality)[12], ylab = colnames(wine_quality)[13])
+plot(wine_quality_red[,11],wine_quality_red[,12], xlab = colnames(wine_quality)[12], ylab = colnames(wine_quality)[13])
+
+#VIF
+X_scaled = scale(as.matrix(cbind(model.matrix(~ wine_quality$type),wine_quality[,-c(1,13)])))
+(VIF = diag(solve(t(X_scaled[,-1])%*%X_scaled[,-1])))
+barplot(VIF)
+
+#########################################################################
+
+
+#Model fit
+library(Rcpp)
+library(RcppArmadillo)
+sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+
+Discrete_BNPMS = function(y, X, prior_params, data_nature = "counts", cat_max = NULL,
+                          n_iter){
+  
+  if(data_nature == "counts"){
+    a = c(-Inf,0:(max(y)+1))
+  }else if(data_nature == "ordinal"){
+    if(is.null(cat_max) == TRUE){
+      return("Error: cat_max must be specified")
+    }else{
+      a = c(-Inf,-Inf,0:(cat_max-2),Inf)
+    }
+  }else if(data_nature == "binary"){
+    a = c(-Inf,0,Inf)
+  }else{
+    return("Error: data_nature argument is out of its possibles configurations")
+  }
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  alpha_sim = numeric(n_iter)
+  gamma_sim = matrix(0, ncol = n_iter, nrow = p) #[Covariate, iteration]
+  s_sim = matrix(1,ncol = n_iter, nrow = n) #[Observation, iteration]
+  z_sim = matrix(0,ncol = n_iter, nrow = n) #[Observation, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor, approximately
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  
+  bar = txtProgressBar(min = 0, max = n_iter, style = 3) #Progress bar
+  for(t in 1:n_iter){
+    
+    #Label and latent (s and z)
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    s_sim[,t] = s
+    z_sim[,t] = z
+    alpha_sim[t] = alpha
+    gamma_sim[,t] = gamma
+    
+    setTxtProgressBar(bar, t-1)
+  }
+  close(bar)
+  
+  list(s = s_sim, z = z_sim, alpha = alpha_sim, gamma = gamma_sim)
+  
+}
+
+
+#Fitting model
+y = as.vector(wine_quality_white[,12])
+X = as.matrix(cbind(1,wine_quality_white[,-12]))
+prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 = 0.1,
+                    b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+model = Discrete_BNPMS(y = y, X = X, prior_params, data_nature = "ordinal",
+                       cat_max = 10, n_iter = 20000)
+s_sim_white = model$s
+z_sim_white = model$z
+alpha_sim_white = model$alpha
+gamma_sim_white = model$gamma
+
+y = as.vector(wine_quality_red[,12])
+X = as.matrix(cbind(1,wine_quality_red[,-12]))
+prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 = 0.1,
+                    b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+model = Discrete_BNPMS(y = y, X = X, prior_params, data_nature = "ordinal",
+                       cat_max = 10, n_iter = 20000)
+s_sim_red = model$s
+z_sim_red = model$z
+alpha_sim_red = model$alpha
+gamma_sim_red = model$gamma
+
+#saveRDS(list(s_white = s_sim_white, z_white = z_sim_white, alpha_white = alpha_sim_white, gamma_white = gamma_sim_white,
+#             s_red = s_sim_red, z_red = z_sim_red,alpha_red = alpha_sim_red, gamma_red = gamma_sim_red), "wine_quality_fitting.rds")
+
+
+#########################################################################
+
+
+model = readRDS("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Data application/Wine quality/wine_quality_fitting.rds") #List with s, z, alpha and gamma for each type of wine
+#White wine
+y_white = as.vector(wine_quality_white[,12])
+X_white = as.matrix(cbind(1,wine_quality_white[,-12]))
+prior_params_white = list(beta0 = c(mean(y_white), rep(0,ncol(X_white)-1)), kappa = 10, a_sigma2 = 0.1,
+                    b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+s_sim_white = model$s_white
+z_sim_white = model$z_white
+alpha_sim_white = model$alpha_white
+gamma_sim_white = model$gamma_white
+
+#Red wine
+y_red = as.vector(wine_quality_red[,12])
+X_red = as.matrix(cbind(1,wine_quality_red[,-12]))
+prior_params_red = list(beta0 = c(mean(y_red), rep(0,ncol(X_red)-1)), kappa = 10, a_sigma2 = 0.1,
+                          b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+s_sim_red = model$s_red
+z_sim_red = model$z_red
+alpha_sim_red = model$alpha_red
+gamma_sim_red = model$gamma_red
+
+rownames(gamma_sim_white) = rownames(gamma_sim_red) = c("Intercept",colnames(wine_quality_white)[-12])
+
+#Chains settings
+n.burn = 2000
+n.thin = 2
+index.f = seq(n.burn+1, length(alpha_sim_red), by = n.thin);length(index.f)
+
+
+####### Model selection
+#White wine
+rowMeans(gamma_sim_white[,index.f]) #Marginal posterior probabilities of variable inclusion
+gamma_aux_white = apply(gamma_sim_white[,index.f], 2, paste0, collapse = "")
+prob_gamma_white = sort(table(gamma_aux_white)/length(index.f), decreasing = TRUE) #Model probabilities
+prob_gamma_white[1:3] #Most probable models and their probabilities
+gamma_MP_white = as.integer(strsplit(names(prob_gamma_white)[1], "")[[1]]);gamma_MP_white #MP Bayes estimator
+names(gamma_MP_white) = c("Intercept",colnames(wine_quality_white)[-12])
+gamma_MP_white
+#fixed acidity; volatile acidity; residual sugar; free sulfur dioxide; density; pH; sulphates; alcohol.
+
+#Red wine
+rowMeans(gamma_sim_red[,index.f]) #Marginal posterior probabilities of variable inclusion
+gamma_aux_red = apply(gamma_sim_red[,index.f], 2, paste0, collapse = "")
+prob_gamma_red = sort(table(gamma_aux_red)/length(index.f), decreasing = TRUE) #Model probabilities
+prob_gamma_red[1:3] #Most probable models and their probabilities
+gamma_MP_red = as.integer(strsplit(names(prob_gamma_red)[1], "")[[1]]);gamma_MP_red #MP Bayes estimator
+names(gamma_MP_red) = c("Intercept",colnames(wine_quality_red)[-12])
+gamma_MP_red
+#volatile acidity; chlorides; density; pH; sulphates; alcohol.
+
+
+
+####### Estimated Mass function as a function of Alcohol
+x_white = colMeans(X_white) #Predictive covariates for red wine
+x_red = colMeans(X_red) #Predictive covariates for red wine
+#for red wine
+x_alcohol_7.5_red = x_red; x_alcohol_7.5_red["alcohol"] = 7.5
+x_alcohol_10_red = x_red; x_alcohol_10_red["alcohol"] = 10
+x_alcohol_12.5_red = x_red; x_alcohol_12.5_red["alcohol"] = 12.5
+x_alcohol_15_red = x_red; x_alcohol_15_red["alcohol"] = 15
+#for white wine
+x_alcohol_7.5_white = x_white; x_alcohol_7.5_white["alcohol"] = 7.5
+x_alcohol_10_white = x_white; x_alcohol_10_white["alcohol"] = 10
+x_alcohol_12.5_white = x_white; x_alcohol_12.5_white["alcohol"] = 12.5
+x_alcohol_15_white = x_white; x_alcohol_15_white["alcohol"] = 15
+
+#configurations for the use of the most probable model
+#White wine
+coord_model_white = index.f[which(apply(gamma_sim_white[,index.f], 2, function(col) all(col == gamma_MP_white)))];length(coord_model_white)
+q_white = sum(gamma_MP_white)
+beta0_gamma_white = prior_params_white$beta0[gamma_MP_white == 1]
+X_gamma_white = X_white[, gamma_MP_white == 1,drop = F]
+x_alcohol_7.5_white_gamma = x_alcohol_7.5_white[gamma_MP_white == 1]
+x_alcohol_10_white_gamma = x_alcohol_10_white[gamma_MP_white == 1]
+x_alcohol_12.5_white_gamma = x_alcohol_12.5_white[gamma_MP_white == 1]
+x_alcohol_15_white_gamma = x_alcohol_15_white[gamma_MP_white == 1]
+
+#Red wine
+coord_model_red = index.f[which(apply(gamma_sim_red[,index.f], 2, function(col) all(col == gamma_MP_red)))];length(coord_model_red)
+q_red = sum(gamma_MP_red)
+beta0_gamma_red = prior_params_red$beta0[gamma_MP_red == 1]
+X_gamma_red = X_red[, gamma_MP_red == 1,drop = F]
+x_alcohol_7.5_red_gamma = x_alcohol_7.5_red[gamma_MP_red == 1]
+x_alcohol_10_red_gamma = x_alcohol_10_red[gamma_MP_red == 1]
+x_alcohol_12.5_red_gamma = x_alcohol_12.5_red[gamma_MP_red == 1]
+x_alcohol_15_red_gamma = x_alcohol_15_red[gamma_MP_red == 1]
+
+
+#computing predictive function
+a = c(-Inf,-Inf,0:8,Inf)
+#White wine
+ypred_7.5_white = ypred_10_white = ypred_12.5_white = ypred_15_white = matrix(0, nrow = length(a)-1, ncol = length(coord_model_white)) #[grid, iteration]
+it = 1
+n = length(y_white)
+for(t in coord_model_white){
+  s = s_sim_white[,t]
+  z = z_sim_white[,t]
+  for(h in 1:max(s)){
+    n_h = sum(s == h)
+    X_h = X_gamma_white[s == h,,drop = F]
+    z_h = z[s == h]
+    M_h = diag(1/prior_params_white$kappa, q_white) + t(X_h)%*%X_h
+    beta_h = solve(M_h)%*%(beta0_gamma_white/prior_params_white$kappa + t(X_h)%*%z_h)
+    a_h = prior_params_white$a_sigma2 + n_h/2
+    b_h = prior_params_white$b_sigma2 + 0.5*(t(z_h)%*%z_h + t(beta0_gamma_white)%*%beta0_gamma_white/prior_params_white$kappa - t(beta_h)%*%M_h%*%beta_h)
+    
+    x0 = x_alcohol_7.5_white_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_7.5_white[,it] = ypred_7.5_white[,it] + n_h/(alpha_sim_white[t]+n)*(upper-lower)
+    x0 = x_alcohol_10_white_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_10_white[,it] = ypred_10_white[,it] + n_h/(alpha_sim_white[t]+n)*(upper-lower)
+    x0 = x_alcohol_12.5_white_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_12.5_white[,it] = ypred_12.5_white[,it] + n_h/(alpha_sim_white[t]+n)*(upper-lower)
+    x0 = x_alcohol_15_white_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_15_white[,it] = ypred_15_white[,it] + n_h/(alpha_sim_white[t]+n)*(upper-lower)
+  }
+  x0 = x_alcohol_7.5_white_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  ypred_7.5_white[,it] = ypred_7.5_white[,it] + alpha_sim_white[t]/(alpha_sim_white[t]+n)*(upper-lower)
+  x0 = x_alcohol_10_white_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  ypred_10_white[,it] = ypred_10_white[,it] + alpha_sim_white[t]/(alpha_sim_white[t]+n)*(upper-lower)
+  x0 = x_alcohol_12.5_white_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  ypred_12.5_white[,it] = ypred_12.5_white[,it] + alpha_sim_white[t]/(alpha_sim_white[t]+n)*(upper-lower)
+  x0 = x_alcohol_15_white_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  ypred_15_white[,it] = ypred_15_white[,it] + alpha_sim_white[t]/(alpha_sim_white[t]+n)*(upper-lower)
+  
+  it = it + 1
+}
+
+#Red wine
+ypred_7.5_red = ypred_10_red = ypred_12.5_red = ypred_15_red = matrix(0, nrow = length(a)-1, ncol = length(coord_model_red)) #[grid, iteration]
+it = 1
+n = length(y_red)
+for(t in coord_model_red){
+  s = s_sim_red[,t]
+  z = z_sim_red[,t]
+  for(h in 1:max(s)){
+    n_h = sum(s == h)
+    X_h = X_gamma_red[s == h,,drop = F]
+    z_h = z[s == h]
+    M_h = diag(1/prior_params_red$kappa, q_red) + t(X_h)%*%X_h
+    beta_h = solve(M_h)%*%(beta0_gamma_red/prior_params_red$kappa + t(X_h)%*%z_h)
+    a_h = prior_params_red$a_sigma2 + n_h/2
+    b_h = prior_params_red$b_sigma2 + 0.5*(t(z_h)%*%z_h + t(beta0_gamma_red)%*%beta0_gamma_red/prior_params_red$kappa - t(beta_h)%*%M_h%*%beta_h)
+    
+    x0 = x_alcohol_7.5_red_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_7.5_red[,it] = ypred_7.5_red[,it] + n_h/(alpha_sim_red[t]+n)*(upper-lower)
+    x0 = x_alcohol_10_red_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_10_red[,it] = ypred_10_red[,it] + n_h/(alpha_sim_red[t]+n)*(upper-lower)
+    x0 = x_alcohol_12.5_red_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_12.5_red[,it] = ypred_12.5_red[,it] + n_h/(alpha_sim_red[t]+n)*(upper-lower)
+    x0 = x_alcohol_15_red_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_15_red[,it] = ypred_15_red[,it] + n_h/(alpha_sim_red[t]+n)*(upper-lower)
+  }
+  x0 = x_alcohol_7.5_red_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  ypred_7.5_red[,it] = ypred_7.5_red[,it] + alpha_sim_red[t]/(alpha_sim_red[t]+n)*(upper-lower)
+  x0 = x_alcohol_10_red_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  ypred_10_red[,it] = ypred_10_red[,it] + alpha_sim_red[t]/(alpha_sim_red[t]+n)*(upper-lower)
+  x0 = x_alcohol_12.5_red_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  ypred_12.5_red[,it] = ypred_12.5_red[,it] + alpha_sim_red[t]/(alpha_sim_red[t]+n)*(upper-lower)
+  x0 = x_alcohol_15_red_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  ypred_15_red[,it] = ypred_15_red[,it] + alpha_sim_red[t]/(alpha_sim_red[t]+n)*(upper-lower)
+  
+  it = it + 1
+}
+
+#Average curve
+ypred_mean_7.5_red = ypred_mean_10_red = ypred_mean_12.5_red = ypred_mean_15_red =
+  ypred_mean_7.5_white = ypred_mean_10_white = ypred_mean_12.5_white = ypred_mean_15_white =
+  rep(0,length(a)-1)
+for(j in 1:(length(a)-1)){
+  #red
+  ypred_mean_7.5_red[j] = mean(ypred_7.5_red[j,])
+  ypred_mean_10_red[j] = mean(ypred_10_red[j,])
+  ypred_mean_12.5_red[j] = mean(ypred_12.5_red[j,])
+  ypred_mean_15_red[j] = mean(ypred_15_red[j,])
+  #white
+  ypred_mean_7.5_white[j] = mean(ypred_7.5_white[j,])
+  ypred_mean_10_white[j] = mean(ypred_10_white[j,])
+  ypred_mean_12.5_white[j] = mean(ypred_12.5_white[j,])
+  ypred_mean_15_white[j] = mean(ypred_15_white[j,])
+}
+
+
+#Graphics
+par(mfrow = c(1,2))
+#red wine
+plot(c(1,10), c(0,0.8), type = "n", xlab = "Score", ylab = "Mass", main = "Red wine")
+abline(v = c(0:11),h = seq(0,1,by = 0.1), col = "grey80")
+lines(prop.table(table(factor(wine_quality_red[,12], levels = 1:10))), type = "o", pch = 16, cex = 1.3, col = "grey80", lwd = 2, lty = 3)
+lines(c(1:10), ypred_mean_7.5_red[-1], type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_10_red[-1], type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_12.5_red[-1], type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_15_red[-1], type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('7.5°','10°','12.5°','15°'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+#white wine
+plot(c(1,10), c(0,0.8), type = "n", xlab = "Score", ylab = "Mass", main = "White wine")
+abline(v = c(0:11),h = seq(0,1,by = 0.1), col = "grey80")
+lines(prop.table(table(factor(wine_quality_white[,12], levels = 1:10))), type = "o", pch = 16, cex = 1.3, col = "grey80", lwd = 2, lty = 3)
+lines(c(1:10), ypred_mean_7.5_white[-1], type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_10_white[-1], type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_12.5_white[-1], type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_15_white[-1], type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('7.5°','10°','12.5°','15°'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.7, lty = 1)
+
+#PDF 10x5
+
+
+
+
+
+####### Estimated Mass function as a function of pH
+x_white = colMeans(X_white) #Predictive covariates for red wine
+x_red = colMeans(X_red) #Predictive covariates for red wine
+#for red wine
+x_pH_2.8_red = x_red; x_pH_2.8_red["pH"] = 2.8
+x_pH_3.3_red = x_red; x_pH_3.3_red["pH"] = 3.3
+x_pH_3.8_red = x_red; x_pH_3.8_red["pH"] = 3.8
+#for white wine
+x_pH_2.8_white = x_white; x_pH_2.8_white["pH"] = 2.8
+x_pH_3.3_white = x_white; x_pH_3.3_white["pH"] = 3.3
+x_pH_3.8_white = x_white; x_pH_3.8_white["pH"] = 3.8
+
+#configurations for the use of the most probable model
+#White wine
+coord_model_white = index.f[which(apply(gamma_sim_white[,index.f], 2, function(col) all(col == gamma_MP_white)))];length(coord_model_white)
+q_white = sum(gamma_MP_white)
+beta0_gamma_white = prior_params_white$beta0[gamma_MP_white == 1]
+X_gamma_white = X_white[, gamma_MP_white == 1,drop = F]
+x_pH_2.8_white_gamma = x_pH_2.8_white[gamma_MP_white == 1]
+x_pH_3.3_white_gamma = x_pH_3.3_white[gamma_MP_white == 1]
+x_pH_3.8_white_gamma = x_pH_3.8_white[gamma_MP_white == 1]
+
+#Red wine
+coord_model_red = index.f[which(apply(gamma_sim_red[,index.f], 2, function(col) all(col == gamma_MP_red)))];length(coord_model_red)
+q_red = sum(gamma_MP_red)
+beta0_gamma_red = prior_params_red$beta0[gamma_MP_red == 1]
+X_gamma_red = X_red[, gamma_MP_red == 1,drop = F]
+x_pH_2.8_red_gamma = x_pH_2.8_red[gamma_MP_red == 1]
+x_pH_3.3_red_gamma = x_pH_3.3_red[gamma_MP_red == 1]
+x_pH_3.8_red_gamma = x_pH_3.8_red[gamma_MP_red == 1]
+
+
+#computing predictive function
+a = c(-Inf,-Inf,0:8,Inf)
+#White wine
+ypred_2.8_white = ypred_3.3_white = ypred_3.8_white = matrix(0, nrow = length(a)-1, ncol = length(coord_model_white)) #[grid, iteration]
+it = 1
+n = length(y_white)
+for(t in coord_model_white){
+  s = s_sim_white[,t]
+  z = z_sim_white[,t]
+  for(h in 1:max(s)){
+    n_h = sum(s == h)
+    X_h = X_gamma_white[s == h,,drop = F]
+    z_h = z[s == h]
+    M_h = diag(1/prior_params_white$kappa, q_white) + t(X_h)%*%X_h
+    beta_h = solve(M_h)%*%(beta0_gamma_white/prior_params_white$kappa + t(X_h)%*%z_h)
+    a_h = prior_params_white$a_sigma2 + n_h/2
+    b_h = prior_params_white$b_sigma2 + 0.5*(t(z_h)%*%z_h + t(beta0_gamma_white)%*%beta0_gamma_white/prior_params_white$kappa - t(beta_h)%*%M_h%*%beta_h)
+    
+    x0 = x_pH_2.8_white_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_2.8_white[,it] = ypred_2.8_white[,it] + n_h/(alpha_sim_white[t]+n)*(upper-lower)
+    x0 = x_pH_3.3_white_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_3.3_white[,it] = ypred_3.3_white[,it] + n_h/(alpha_sim_white[t]+n)*(upper-lower)
+    x0 = x_pH_3.8_white_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_3.8_white[,it] = ypred_3.8_white[,it] + n_h/(alpha_sim_white[t]+n)*(upper-lower)
+  }
+  x0 = x_pH_2.8_white_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  ypred_2.8_white[,it] = ypred_2.8_white[,it] + alpha_sim_white[t]/(alpha_sim_white[t]+n)*(upper-lower)
+  x0 = x_pH_3.3_white_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  ypred_3.3_white[,it] = ypred_3.3_white[,it] + alpha_sim_white[t]/(alpha_sim_white[t]+n)*(upper-lower)
+  x0 = x_pH_3.8_white_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_white))/as.numeric(sqrt((prior_params_white$b_sigma2/prior_params_white$a_sigma2)*(1+prior_params_white$kappa*t(x0)%*%x0))), 2*prior_params_white$a_sigma2)
+  ypred_3.8_white[,it] = ypred_3.8_white[,it] + alpha_sim_white[t]/(alpha_sim_white[t]+n)*(upper-lower)
+  
+  it = it + 1
+}
+
+#Red wine
+ypred_2.8_red = ypred_3.3_red = ypred_3.8_red = matrix(0, nrow = length(a)-1, ncol = length(coord_model_red)) #[grid, iteration]
+it = 1
+n = length(y_red)
+for(t in coord_model_red){
+  s = s_sim_red[,t]
+  z = z_sim_red[,t]
+  for(h in 1:max(s)){
+    n_h = sum(s == h)
+    X_h = X_gamma_red[s == h,,drop = F]
+    z_h = z[s == h]
+    M_h = diag(1/prior_params_red$kappa, q_red) + t(X_h)%*%X_h
+    beta_h = solve(M_h)%*%(beta0_gamma_red/prior_params_red$kappa + t(X_h)%*%z_h)
+    a_h = prior_params_red$a_sigma2 + n_h/2
+    b_h = prior_params_red$b_sigma2 + 0.5*(t(z_h)%*%z_h + t(beta0_gamma_red)%*%beta0_gamma_red/prior_params_red$kappa - t(beta_h)%*%M_h%*%beta_h)
+    
+    x0 = x_pH_2.8_red_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_2.8_red[,it] = ypred_2.8_red[,it] + n_h/(alpha_sim_red[t]+n)*(upper-lower)
+    x0 = x_pH_3.3_red_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_3.3_red[,it] = ypred_3.3_red[,it] + n_h/(alpha_sim_red[t]+n)*(upper-lower)
+    x0 = x_pH_3.8_red_gamma
+    lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    upper = pt((a[-1] - as.numeric(t(x0)%*%beta_h))/as.numeric(sqrt((b_h/a_h)*(1+t(x0)%*%solve(M_h)%*%x0))), 2*a_h)
+    ypred_3.8_red[,it] = ypred_3.8_red[,it] + n_h/(alpha_sim_red[t]+n)*(upper-lower)
+  }
+  x0 = x_pH_2.8_red_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  ypred_2.8_red[,it] = ypred_2.8_red[,it] + alpha_sim_red[t]/(alpha_sim_red[t]+n)*(upper-lower)
+  x0 = x_pH_3.3_red_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  ypred_3.3_red[,it] = ypred_3.3_red[,it] + alpha_sim_red[t]/(alpha_sim_red[t]+n)*(upper-lower)
+  x0 = x_pH_3.8_red_gamma
+  lower = pt((a[-length(a)] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  upper = pt((a[-1] - as.numeric(t(x0)%*%beta0_gamma_red))/as.numeric(sqrt((prior_params_red$b_sigma2/prior_params_red$a_sigma2)*(1+prior_params_red$kappa*t(x0)%*%x0))), 2*prior_params_red$a_sigma2)
+  ypred_3.8_red[,it] = ypred_3.8_red[,it] + alpha_sim_red[t]/(alpha_sim_red[t]+n)*(upper-lower)
+  
+  it = it + 1
+}
+
+
+#Average curve
+ypred_mean_2.8_red = ypred_mean_3.3_red = ypred_mean_3.8_red =
+  ypred_mean_2.8_white = ypred_mean_3.3_white = ypred_mean_3.8_white =
+  rep(0,length(a)-1)
+for(j in 1:(length(a)-1)){
+  #red
+  ypred_mean_2.8_red[j] = mean(ypred_2.8_red[j,])
+  ypred_mean_3.3_red[j] = mean(ypred_3.3_red[j,])
+  ypred_mean_3.8_red[j] = mean(ypred_3.8_red[j,])
+  #white
+  ypred_mean_2.8_white[j] = mean(ypred_2.8_white[j,])
+  ypred_mean_3.3_white[j] = mean(ypred_3.3_white[j,])
+  ypred_mean_3.8_white[j] = mean(ypred_3.8_white[j,])
+}
+
+
+#Graphics
+par(mfrow = c(1,2))
+#red wine
+plot(c(1,10), c(0,0.7), type = "n", xlab = "Score", ylab = "Mass", main = "Red wine")
+abline(v = c(0:11),h = seq(0,1,by = 0.1), col = "grey80")
+lines(prop.table(table(factor(wine_quality_red[,12], levels = 1:10))), type = "o", pch = 16, cex = 1.3, col = "grey80", lwd = 2, lty = 3)
+lines(c(1:10), ypred_mean_2.8_red[-1], type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_3.3_red[-1], type = "o", pch = 16, cex = 1.3, col = "orange3", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_3.8_red[-1], type = "o", pch = 16, cex = 1.3, col = "aquamarine4", lwd = 2,lty = 3)
+legend('topright', legend = c('2.8','3.3','3.8'),
+       col = c("violetred3","orange3","aquamarine4"),
+       lwd = 3,cex = 0.7, lty = 1)
+#white wine
+plot(c(1,10), c(0,0.7), type = "n", xlab = "Score", ylab = "Mass", main = "White wine")
+abline(v = c(0:11),h = seq(0,1,by = 0.1), col = "grey80")
+lines(prop.table(table(factor(wine_quality_white[,12], levels = 1:10))), type = "o", pch = 16, cex = 1.3, col = "grey80", lwd = 2, lty = 3)
+lines(c(1:10), ypred_mean_2.8_white[-1], type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_3.3_white[-1], type = "o", pch = 16, cex = 1.3, col = "orange3", lwd = 2,lty = 3)
+lines(c(1:10), ypred_mean_3.8_white[-1], type = "o", pch = 16, cex = 1.3, col = "aquamarine4", lwd = 2,lty = 3)
+legend('topright', legend = c('2.8','3.3','3.8'),
+       col = c("violetred3","orange3","aquamarine4"),
+       lwd = 3,cex = 0.7, lty = 1)
+
+#PDF 10x5
+
+
+
+
+##################################################
+####      Data: PhD Publications         ########
+#### Response: Number of publications   ########
+###############################################
+rm(list = ls());gc()
+
+#Dataset reading
+library(AER)
+data(PhDPublications)
+ncol(PhDPublications) #6
+nrow(PhDPublications) #915
+summary(PhDPublications)
+PhDPublications$gender = as.factor(PhDPublications$gender)
+PhDPublications$married = as.factor(PhDPublications$married)
+
+#Descriptive analysis
+plot(prop.table(table(factor(PhDPublications[,"articles"], levels = 1:20))))
+
+plot(c(1,20),c(0,0.8),type = "n")
+lines(prop.table(table(factor(PhDPublications[PhDPublications$gender == "male","articles"], levels = 1:20))), type = "o", pch = 16, lwd = 2, col = "grey30")
+lines(prop.table(table(factor(PhDPublications[PhDPublications$gender == "female","articles"], levels = 1:20))), type = "o", pch = 16, lwd = 2, col = "darkred")
+plot(PhDPublications$gender)
+
+plot(c(1,20),c(0,0.8),type = "n")
+lines(prop.table(table(factor(PhDPublications[PhDPublications$married == "yes","articles"], levels = 1:20))), type = "o", pch = 16, lwd = 2, col = "grey30")
+lines(prop.table(table(factor(PhDPublications[PhDPublications$married == "no","articles"], levels = 1:20))), type = "o", pch = 16, lwd = 2, col = "darkred")
+plot(PhDPublications$married)
+
+plot(PhDPublications$kids,PhDPublications$articles)
+plot(prop.table(table(factor(PhDPublications[,"kids"], levels = 1:5))))
+
+plot(PhDPublications$prestige,PhDPublications$articles)
+hist(PhDPublications$prestige, freq = F)
+
+plot(PhDPublications$mentor,PhDPublications$articles)
+hist(PhDPublications$mentor, freq = F)
+
+#########################################################################
+
+
+#Model fit
+library(Rcpp)
+library(RcppArmadillo)
+sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+
+Discrete_BNPMS = function(y, X, prior_params, data_nature = "counts", cat_max = NULL,
+                          n_iter){
+  
+  if(data_nature == "counts"){
+    a = c(-Inf,0:(max(y)+1))
+  }else if(data_nature == "ordinal"){
+    if(is.null(cat_max) == TRUE){
+      return("Error: cat_max must be specified")
+    }else{
+      a = c(-Inf,-Inf,0:(cat_max-2),Inf)
+    }
+  }else if(data_nature == "binary"){
+    a = c(-Inf,0,Inf)
+  }else{
+    return("Error: data_nature argument is out of its possibles configurations")
+  }
+  
+  #Datasize
+  n = nrow(X)
+  p = ncol(X)
+  
+  # Objects
+  alpha_sim = numeric(n_iter)
+  gamma_sim = matrix(0, ncol = n_iter, nrow = p) #[Covariate, iteration]
+  s_sim = matrix(1,ncol = n_iter, nrow = n) #[Observation, iteration]
+  z_sim = matrix(0,ncol = n_iter, nrow = n) #[Observation, iteration]
+  
+  #Prior hyperparameters
+  beta0 = prior_params$beta0
+  kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
+  a_alpha = prior_params$a_alpha
+  b_alpha = prior_params$b_alpha
+  rho = prior_params$rho
+  
+  #Womack log-prior 
+  out = rep(-Inf, p)
+  out[p] = 0
+  for(l in (p-2):0){
+    j = (l+1):(p-1)
+    bb = out[j+1] + lgamma(j+1) - lgamma(l+1) - lgamma(j+1-l) + log(rho)
+    out[l+1] = log(sum(exp(bb-max(bb)))) + max(bb)
+    out = out - max(out) -log(sum(exp(out-max(out))))		
+  }
+  prior_gamma = out + lbeta(c(1:p), p-c(0:(p-1))) + log(p)
+  
+  
+  #### Initial values
+  alpha = 1
+  q = ceiling(p/2) #A half of predictor, approximately
+  gamma = c(1, c(rep(1,q-1),rep(0,p-q))[sample(1:(p-1), p-1, replace = F)]) 
+  X_gamma = X[, gamma == 1,drop = F]
+  beta0_gamma = beta0[gamma == 1]
+  s = sample(1:4, n, replace = T)
+  n_groups = tabulate(s, nbins = max(s)) #Number of units per cluster
+  k = max(s)
+  z = y
+  
+  
+  bar = txtProgressBar(min = 0, max = n_iter, style = 3) #Progress bar
+  for(t in 1:n_iter){
+    
+    #Label and latent (s and z)
+    s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
+                                    alpha = alpha, q = q)
+    
+    n_groups = s_z_ngroups$n_groups
+    s = s_z_ngroups$s
+    z = s_z_ngroups$z
+    k = s_z_ngroups$k
+    
+    #Contraction parameter (alpha)
+    logeta = log(rbeta(1, alpha + 1, n))
+    pi1 = (a_alpha + k - 1)/(n*(b_alpha-logeta) + a_alpha + k - 1)
+    alpha = rgamma(1, a_alpha + k - 1 + rbinom(1, 1, pi1), b_alpha - logeta)
+    
+    
+    #Selector parameter (gamma)
+    gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
+    gamma = gamma_and_q$gamma
+    q = gamma_and_q$q
+    X_gamma = X[, gamma == 1,drop = F]
+    beta0_gamma = beta0[gamma == 1]
+    
+    #Save results
+    s_sim[,t] = s
+    z_sim[,t] = z
+    alpha_sim[t] = alpha
+    gamma_sim[,t] = gamma
+    
+    setTxtProgressBar(bar, t-1)
+  }
+  close(bar)
+  
+  list(s = s_sim, z = z_sim, alpha = alpha_sim, gamma = gamma_sim)
+  
+}
+
+
+#Fitting model
+y = as.vector(PhDPublications[,1])
+X = as.matrix(cbind(model.matrix(~ PhDPublications$gender + PhDPublications$married), PhDPublications[,-c(1:3)]))
+colnames(X) = c("Intercept", "gender_female", "married_yes", "kids", "prestige", "mentor")
+prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 = 0.1,
+                    b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+model = Discrete_BNPMS(y = y, X = X, prior_params, n_iter = 20000)
+s_sim = model$s
+z_sim = model$z
+alpha_sim = model$alpha
+gamma_sim = model$gamma
+
+#saveRDS(list(s = model$s, z = model$z,alpha = model$alpha, gamma = model$gamma), "PhDPublications_fitting.rds")
+
+#########################################################################
+
+y = as.vector(PhDPublications[,1])
+X = as.matrix(cbind(model.matrix(~ PhDPublications$gender + PhDPublications$married), PhDPublications[,-c(1:3)]))
+colnames(X) = c("Intercept", "gender_female", "married_yes", "kids", "prestige", "mentor")
+prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 = 0.1,
+                    b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+
+model = readRDS("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Data application/PhD Publications/PhDPublications_fitting.rds") #List with s, z, alpha and gamma
+s_sim = model$s
+z_sim = model$z
+alpha_sim = model$alpha
+gamma_sim = model$gamma
+rownames(gamma_sim) = colnames(X)
+
+#Chains settings
+n.burn = 5000
+n.thin = 2
+index.f = seq(n.burn+1, length(alpha_sim), by = n.thin);length(index.f)
+
+####### Model selection
+rowMeans(gamma_sim[,index.f]) #Marginal posterior probabilities of variable inclusion
+gamma_aux = apply(gamma_sim[,index.f], 2, paste0, collapse = "")
+prob_gamma = sort(table(gamma_aux)/length(index.f), decreasing = TRUE) #Model probabilities
+prob_gamma[1:3] #Most posterior likely and its probability
+gamma_MP = as.integer(strsplit(names(prob_gamma)[1], "")[[1]]);gamma_MP #MP Bayes estimator
+names(gamma_MP) = rownames(gamma_sim)
+gamma_MP
+
+
+####### Estimated Mass function as a function of mentro's prestige
+x_0 = colMeans(X) #Predictive covariates
+x_0_0 = x_0; x_0_0["mentor"] = 0
+x_5_0 = x_0; x_5_0["mentor"] = 5
+x_10_0 = x_0; x_10_0["mentor"] = 10
+x_15_0 = x_0; x_15_0["mentor"] = 20
+
+#configurations for the use of the most probable model
+coord_model = index.f[which(apply(gamma_sim[,index.f], 2, function(col) all(col == gamma_MP)))];length(coord_model)
+q = sum(gamma_MP)
+beta0_gamma = prior_params$beta0[gamma_MP == 1]
+X_gamma = X[, gamma_MP == 1,drop = F]
+x_0_0_gamma = x_0_0[gamma_MP == 1]
+x_5_0_gamma = x_5_0[gamma_MP == 1]
+x_10_0_gamma = x_10_0[gamma_MP == 1]
+x_15_0_gamma = x_15_0[gamma_MP == 1]
+
+
+#computing predictive function
+a = c(-Inf,0:(max(y)+1))
+ypred_0_0 = ypred_5_0 = ypred_10_0 = ypred_15_0 = matrix(0, nrow = length(a)-1, ncol = length(coord_model)) #[grid, iteration]
+it = 1
+n = length(y)
+for(t in coord_model){
+  s = s_sim[,t]
+  z = z_sim[,t]
+  for(h in 1:max(s)){
+    n_h = sum(s == h)
+    X_h = X_gamma[s == h,,drop = F]
+    z_h = z[s == h]
+    M_h = diag(1/prior_params$kappa, q) + t(X_h)%*%X_h
+    beta_h = solve(M_h)%*%(beta0_gamma/prior_params$kappa + t(X_h)%*%z_h)
+    
+    x0 = x_0_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_0_0[,it] = ypred_0_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_5_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_5_0[,it] = ypred_5_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_10_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_10_0[,it] = ypred_10_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+    x0 = x_15_0_gamma
+    lower = pnorm((a[-length(a)]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    upper = pnorm((a[-1]), mean = as.numeric(t(x0)%*%beta_h), sd = as.numeric(sqrt(1+t(x0)%*%solve(M_h)%*%x0)))
+    ypred_15_0[,it] = ypred_15_0[,it] + n_h/(alpha_sim[t]+n)*(upper-lower)
+  }
+  
+  x0 = x_0_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_0_0[,it] = ypred_0_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_5_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_5_0[,it] = ypred_5_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_10_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_10_0[,it] = ypred_10_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  x0 = x_15_0_gamma
+  lower = pnorm(a[-length(a)], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  upper = pnorm(a[-1], mean = as.numeric(t(x0)%*%beta0_gamma), sd = as.numeric(sqrt((1+prior_params$kappa*t(x0)%*%x0))))
+  ypred_15_0[,it] = ypred_15_0[,it] + alpha_sim[t]/(alpha_sim[t]+n)*(upper-lower)
+  
+  it = it + 1
+}
+
+#Average curve
+ypred_mean_0_0 = ypred_mean_5_0 = ypred_mean_10_0 = ypred_mean_15_0 = rep(0,length(a)-1)
+for(j in 1:(length(a)-1)){
+  ypred_mean_0_0[j] = mean(ypred_0_0[j,])
+  ypred_mean_5_0[j] = mean(ypred_5_0[j,])
+  ypred_mean_10_0[j] = mean(ypred_10_0[j,])
+  ypred_mean_15_0[j] = mean(ypred_15_0[j,])
+}
+
+
+#Graphics
+par(mfrow = c(1,1))
+
+plot(c(0,10), c(0,0.6), type = "n", xlab = "Number of Articles", ylab = "Probability", main = "")
+abline(v = seq(0,20, by = 1), h = seq(0,1,by = 0.1), col = "grey80")
+lines(c(0:(length(ypred_mean_0_0)-1)), ypred_mean_0_0, type = "o", pch = 16, cex = 1.3, col = "violetred3", lwd = 2,lty = 3)
+lines(c(0:(length(ypred_mean_5_0)-1)), ypred_mean_5_0, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
+lines(c(0:(length(ypred_mean_10_0)-1)), ypred_mean_10_0, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
+lines(c(0:(length(ypred_mean_15_0)-1)), ypred_mean_15_0, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
+legend('topright', legend = c('mentor = 0','mentor = 5','mentor = 10','mentor = 20'),
+       col = c("violetred3","skyblue4","orange4","seagreen"),
+       lwd = 3,cex = 0.8, lty = 1)
+
+#PDF 10x4
+
+
+### FIN.
