@@ -267,7 +267,7 @@ List s_z_simulationCPP(arma::ivec y, arma::mat X_gamma, arma::ivec s, int k, arm
         mu_h = arma::dot(x_i, M_h_inv.slice(h)*pseudo_beta_h.col(h));
         sigma_h = safe_sqrtCPP(1 + arma::dot(x_i, M_h_inv.slice(h)*x_i));
         upper = std::min(R::pnorm(a[y[i]+1], mu_h, sigma_h, 1, 0), 1 - 1e-10);
-        lower = std::min(R::pnorm(a[y[i]], mu_h, sigma_h, 1, 0), 1 - 1e-10);
+        lower = std::max(R::pnorm(a[y[i]], mu_h, sigma_h, 1, 0), 1e-10);
         if(upper > lower){
           u = R::runif(lower, upper);
           z[i] = R::qnorm(u, mu_h, sigma_h, 1, 0);
@@ -276,7 +276,7 @@ List s_z_simulationCPP(arma::ivec y, arma::mat X_gamma, arma::ivec s, int k, arm
         }
       }else{ //i is in a own cluster => define with z[i] information
         upper = std::min(R::pnorm(a[y[i]+1], mu_0, 1, 1, 0), 1 - 1e-10);
-        lower = std::min(R::pnorm(a[y[i]], mu_0, 1, 1, 0), 1 - 1e-10);
+        lower = std::max(R::pnorm(a[y[i]], mu_0, 1, 1, 0), 1e-10);
         if(upper > lower){
           u = R::runif(lower, upper);
           z[i] = R::qnorm(u, mu_0, 1, 1, 0);
