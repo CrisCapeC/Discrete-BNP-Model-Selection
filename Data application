@@ -88,8 +88,6 @@ MASS::stepAIC(m_multicll_red, direction = "both", trace = FALSE, k = log(nrow(wi
 # but penalize better. The simulation study anticipated that this tends to happen,
 # and with a sample size of over 1000, our model would be more reliable.
 
-#########################################################################
-
 
 #Model fit
 library(Rcpp)
@@ -217,19 +215,8 @@ prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 =
                     b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
 model = Discrete_BNPMS(y = y, X = X, prior_params, data_nature = "ordinal",
                        cat_max = 10, n_iter = 20000)
-s_sim_red = model$s
-z_sim_red = model$z
-alpha_sim_red = model$alpha
-gamma_sim_red = model$gamma
-
-#saveRDS(list(s_white = s_sim_white, z_white = z_sim_white, alpha_white = alpha_sim_white, gamma_white = gamma_sim_white,
-#             s_red = s_sim_red, z_red = z_sim_red,alpha_red = alpha_sim_red, gamma_red = gamma_sim_red), "wine_quality_fitting_std.rds")
 
 
-#########################################################################
-
-
-model = readRDS("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Data application/Wine quality/wine_quality_fitting_std.rds") #List with s, z, alpha and gamma for each type of wine
 #White wine
 y_white = as.vector(wine_quality_white[,12])
 X_white = as.matrix(cbind(1,scale(wine_quality_white[,-12])))
@@ -467,6 +454,8 @@ legend('topleft', legend = c('8°','11.1°','14.2°'),
 
 
 
+
+
 ##############################################################
 ####             Data: Shill Bidding               ##########
 #### Response: Indicator of fraudulent auctioneer ##########
@@ -499,9 +488,6 @@ plot(df$Auction_Duration, df$Class + runif(nrow(df),-0.03,0.03), ylim = c(0,1))
 X_scaled = as.matrix((df[,-10] - colMeans(df[,-10]))/apply(df[,-10], 2, sd))
 (VIF = diag(solve(t(as.matrix(X_scaled))%*%X_scaled)))
 barplot(VIF, ylim = c(0,0.002))
-
-
-#########################################################################
 
 
 #Model fit
@@ -602,20 +588,9 @@ y = as.vector(df[,10])
 X = as.matrix(cbind(1,df[,-10]))
 prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10,
                     a_alpha = 0.1, b_alpha = 0.1, rho = 1)
-model = Discrete_BNPMS(y = y, X = X, prior_params, n_iter = 20000)
-
-#saveRDS(list(s = model$s, z = model$z,alpha = model$alpha, gamma = model$gamma), "shill_bidding_fitting.rds")
-
-#########################################################################
-
-
-y = as.vector(df[,10])
-X = as.matrix(cbind(1,df[,-10]))
+shill_bidding_fitting = Discrete_BNPMS(y = y, X = X, prior_params, n_iter = 20000)
 colnames(X)[1] = "Intercept"
-prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10,
-                    a_alpha = 0.1, b_alpha = 0.1, rho = 1)
 
-shill_bidding_fitting = readRDS("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Data application/Shill Bidding/shill_bidding_fitting.rds") #List with s, z, alpha and gamma
 s_sim = shill_bidding_fitting$s
 z_sim = shill_bidding_fitting$z
 alpha_sim = shill_bidding_fitting$alpha
