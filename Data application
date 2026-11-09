@@ -17,6 +17,7 @@ nrow(wine_quality_red) #1599
 
 
 #Descriptive analysis
+par(mfrow = c(1,1))
 plot(c(1,10),c(0,0.5),type = "n")
 lines(prop.table(table(factor(wine_quality_white[,12], levels = 1:10))), type = "o", pch = 16, lwd = 2, col = "lightgreen")
 lines(prop.table(table(factor(wine_quality_red[,12], levels = 1:10))), type = "o", pch = 16, lwd = 2, col = "violetred4")
@@ -88,11 +89,13 @@ MASS::stepAIC(m_multicll_red, direction = "both", trace = FALSE, k = log(nrow(wi
 # but penalize better. The simulation study anticipated that this tends to happen,
 # and with a sample size of over 1000, our model would be more reliable.
 
+#########################################################################
+
 
 #Model fit
 library(Rcpp)
 library(RcppArmadillo)
-sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
+sourceCpp("C:/.../CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
 
 Discrete_BNPMS = function(y, X, prior_params, data_nature = "counts", cat_max = NULL,
                           n_iter){
@@ -203,7 +206,7 @@ X = as.matrix(cbind(1,scale(wine_quality_white[,-12])))
 prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 = 0.1,
                     b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
 model = Discrete_BNPMS(y = y, X = X, prior_params, data_nature = "ordinal",
-                       cat_max = 10, n_iter = 20000)
+                       cat_max = 10, n_iter = 40000)
 s_sim_white = model$s
 z_sim_white = model$z
 alpha_sim_white = model$alpha
@@ -214,34 +217,29 @@ X = as.matrix(cbind(1,scale(wine_quality_red[,-12])))
 prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 = 0.1,
                     b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
 model = Discrete_BNPMS(y = y, X = X, prior_params, data_nature = "ordinal",
-                       cat_max = 10, n_iter = 20000)
-
+                       cat_max = 10, n_iter = 40000)
+s_sim_red = model$s
+z_sim_red = model$z
+alpha_sim_red = model$alpha
+gamma_sim_red = model$gamma
 
 #White wine
 y_white = as.vector(wine_quality_white[,12])
 X_white = as.matrix(cbind(1,scale(wine_quality_white[,-12])))
 prior_params_white = list(beta0 = c(mean(y_white), rep(0,ncol(X_white)-1)), kappa = 10, a_sigma2 = 0.1,
                     b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
-s_sim_white = model$s_white
-z_sim_white = model$z_white
-alpha_sim_white = model$alpha_white
-gamma_sim_white = model$gamma_white
 
 #Red wine
 y_red = as.vector(wine_quality_red[,12])
 X_red = as.matrix(cbind(1,scale(wine_quality_red[,-12])))
 prior_params_red = list(beta0 = c(mean(y_red), rep(0,ncol(X_red)-1)), kappa = 10, a_sigma2 = 0.1,
                           b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
-s_sim_red = model$s_red
-z_sim_red = model$z_red
-alpha_sim_red = model$alpha_red
-gamma_sim_red = model$gamma_red
 
 rownames(gamma_sim_white) = rownames(gamma_sim_red) = c("Intercept",colnames(X_white)[-1])
 
 #Chains settings
-n.burn = 5000
-n.thin = 2
+n.burn = 10000
+n.thin = 1
 index.f = seq(n.burn+1, length(alpha_sim_white), by = n.thin);length(index.f)
 
 
@@ -254,7 +252,7 @@ prob_gamma_white[1:3] #Most probable models and their probabilities
 gamma_MP_white = as.integer(strsplit(names(prob_gamma_white)[1], "")[[1]]);gamma_MP_white #MP Bayes estimator
 names(gamma_MP_white) = c("Intercept",colnames(wine_quality_white)[-12])
 gamma_MP_white
-#fixed acidity; volatile acidity; residual sugar; free sulfur dioxide; density; pH; sulphates; alcohol.
+#fixed acidity; volatile acidity; residual sugar; free sulfur dioxide; total sulfur dioxide; density; pH; sulphates.
 
 #Red wine
 rowMeans(gamma_sim_red[,index.f]) #Marginal posterior probabilities of variable inclusion
@@ -376,13 +374,14 @@ x_alcohol_10_white = x_white; x_alcohol_10_white["alcohol"] = (11.1 - mean(wine_
 x_alcohol_15_white = x_white; x_alcohol_15_white["alcohol"] = (14.2 - mean(wine_quality_white$alcohol))/sd(wine_quality_white$alcohol)
 
 #configurations for the use of the most probable model
-coord_model_white = index.f[which(apply(gamma_sim_white[,index.f], 2, function(col) all(col == gamma_MP_white)))];length(coord_model_white)
-q_white = sum(gamma_MP_white)
-beta0_gamma_white = prior_params_white$beta0[gamma_MP_white == 1]
-X_gamma_white = X_white[, gamma_MP_white == 1,drop = F]
-x_alcohol_7.5_white_gamma = x_alcohol_7.5_white[gamma_MP_white == 1]
-x_alcohol_10_white_gamma = x_alcohol_10_white[gamma_MP_white == 1]
-x_alcohol_15_white_gamma = x_alcohol_15_white[gamma_MP_white == 1]
+#coord_model_white = index.f[which(apply(gamma_sim_white[,index.f], 2, function(col) all(col == gamma_MP_white)))];length(coord_model_white)
+#q_white = sum(gamma_MP_white)
+#beta0_gamma_white = prior_params_white$beta0[gamma_MP_white == 1]
+#X_gamma_white = X_white[, gamma_MP_white == 1,drop = F]
+#x_alcohol_7.5_white_gamma = x_alcohol_7.5_white[gamma_MP_white == 1]
+#x_alcohol_10_white_gamma = x_alcohol_10_white[gamma_MP_white == 1]
+#x_alcohol_15_white_gamma = x_alcohol_15_white[gamma_MP_white == 1]
+coord_model_white = index.f #averaged predictive
 
 #computing predictive function
 a = c(-Inf,-Inf,0:8,Inf)
@@ -390,8 +389,17 @@ ypred_7.5_white = ypred_10_white = ypred_15_white = matrix(0, nrow = length(a)-1
 it = 1
 n = length(y_white)
 for(t in coord_model_white){
+  gamma = gamma_sim_white[,t]
   s = s_sim_white[,t]
   z = z_sim_white[,t]
+  
+  q_white = sum(gamma)
+  beta0_gamma_white = prior_params_white$beta0[gamma == 1]
+  X_gamma_white = X_white[, gamma == 1,drop = F]
+  x_alcohol_7.5_white_gamma = x_alcohol_7.5_white[gamma == 1]
+  x_alcohol_10_white_gamma = x_alcohol_10_white[gamma == 1]
+  x_alcohol_15_white_gamma = x_alcohol_15_white[gamma == 1]
+  
   for(h in 1:max(s)){
     n_h = sum(s == h)
     X_h = X_gamma_white[s == h,,drop = F]
@@ -456,6 +464,9 @@ legend('topleft', legend = c('8°','11.1°','14.2°'),
 
 
 
+
+
+
 ##############################################################
 ####             Data: Shill Bidding               ##########
 #### Response: Indicator of fraudulent auctioneer ##########
@@ -474,6 +485,20 @@ df = shill_bidding[,-c(1:3)] #First columns ignored
 
 #Descriptive analysis (runif allows visualization for discrete predictors)
 summary(df)
+plot(prop.table(table(df$Class)), type = "o", ylim = c(0,1), pch = 16, col = "aquamarine4")
+
+par(mfrow = c(3,3))
+hist(df[,1], main = colnames(df)[1])
+hist(df[,2], main = colnames(df)[2])
+plot(prop.table(table(df[,3])),, main = colnames(df)[3])
+hist(df[,4], main = colnames(df)[4])
+hist(df[,5], main = colnames(df)[5])
+hist(df[,6], main = colnames(df)[6])
+hist(df[,7], main = colnames(df)[7])
+hist(df[,8], main = colnames(df)[8])
+plot(prop.table(table(df[,9])), main = colnames(df)[9])
+plot(prop.table(table(df[,9],df$Class)), col = c("purple1","skyblue4"))
+
 plot(df$Bidder_Tendency, df$Class, ylim = c(0,1))
 plot(df$Bidding_Ratio, df$Class, ylim = c(0,1))
 plot(df$Successive_Outbidding, df$Class+runif(nrow(df),-0.03,0.03), ylim = c(0,1)) #3 categories
@@ -490,14 +515,30 @@ X_scaled = as.matrix((df[,-10] - colMeans(df[,-10]))/apply(df[,-10], 2, sd))
 barplot(VIF, ylim = c(0,0.002))
 
 
+#########################################################################
+
+
 #Model fit
 library(Rcpp)
 library(RcppArmadillo)
-sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_BINARY_BNPMS_Neals_approach.cpp")
+sourceCpp("C:/.../CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
 
-Discrete_BNPMS = function(y, X, prior_params, n_iter){
+Discrete_BNPMS = function(y, X, prior_params, data_nature = "counts", cat_max = NULL,
+                          n_iter){
   
-  a = c(-Inf,0,Inf)
+  if(data_nature == "counts"){
+    a = c(-Inf,0:(max(y)+1))
+  }else if(data_nature == "ordinal"){
+    if(is.null(cat_max) == TRUE){
+      return("Error: cat_max must be specified")
+    }else{
+      a = c(-Inf,-Inf,0:(cat_max-2),Inf)
+    }
+  }else if(data_nature == "binary"){
+    a = c(-Inf,0,Inf)
+  }else{
+    return("Error: data_nature argument is out of its possibles configurations")
+  }
   
   #Datasize
   n = nrow(X)
@@ -512,6 +553,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter){
   #Prior hyperparameters
   beta0 = prior_params$beta0
   kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
   a_alpha = prior_params$a_alpha
   b_alpha = prior_params$b_alpha
   rho = prior_params$rho
@@ -545,7 +588,7 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter){
     
     #Label and latent (s and z)
     s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
-                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
                                     alpha = alpha, q = q)
     
     n_groups = s_z_ngroups$n_groups
@@ -561,8 +604,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter){
     
     #Selector parameter (gamma)
     gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
-                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
-                                      prior_gamma = prior_gamma)
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
     gamma = gamma_and_q$gamma
     q = gamma_and_q$q
     X_gamma = X[, gamma == 1,drop = F]
@@ -586,9 +629,10 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter){
 #Fitting model
 y = as.vector(df[,10])
 X = as.matrix(cbind(1,df[,-10]))
-prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10,
-                    a_alpha = 0.1, b_alpha = 0.1, rho = 1)
-shill_bidding_fitting = Discrete_BNPMS(y = y, X = X, prior_params, n_iter = 20000)
+prior_params = list(beta0 = c(mean(y), rep(0,ncol(X)-1)), kappa = 10, a_sigma2 = 0.1,
+                    b_sigma2 = 0.1, a_alpha = 0.1, b_alpha = 0.1, rho = 1)
+shill_bidding_fitting = Discrete_BNPMS(y = y, X = X, prior_params, data_nature = "binary",
+                                       n_iter = 40000)
 colnames(X)[1] = "Intercept"
 
 s_sim = shill_bidding_fitting$s
@@ -599,8 +643,8 @@ rownames(gamma_sim) = colnames(X)
 ts.plot(colSums(gamma_sim))
 
 #Chains settings
-n.burn = 5000
-n.thin = 2
+n.burn = 10000
+n.thin = 1
 index.f = seq(n.burn+1, length(alpha_sim), by = n.thin);length(index.f)
 
 
@@ -612,7 +656,7 @@ prob_gamma[1:3] #Posterior model probabilities
 gamma_MP = as.integer(strsplit(names(prob_gamma)[1], "")[[1]]);gamma_MP #MP Bayes estimator
 names(gamma_MP) = c("Intercept",colnames(df)[-10])
 gamma_MP
-#Bidder tendency; Successive_Outbidding; Winning_Ratio.
+#Successive_Outbidding; Winning_Ratio; Auction Duration.
 
 
 ####### Estimated Mass function as a function of Successive_Outbidding and Winning ratio
@@ -841,25 +885,25 @@ legend('topright', legend = c('WR = 0','WR = 0.3','WR = 0.7','WR = 1'),
 
 
 
-####### Estimated Mass function as a function of Successive_Outbidding and Bidder Tendency
+####### Estimated Mass function as a function of Successive_Outbidding and Auction Tendency
 x_0 = colMeans(X[X[,"Successive_Outbidding"] == 0,]) #Predictive covariates
 x_0.5 = colMeans(X[X[,"Successive_Outbidding"] == 0.5,]) #Predictive covariates
 x_1 = colMeans(X[X[,"Successive_Outbidding"] == 1,]) #Predictive covariates
 #for Successive_Outbidding = 0
-x_0_0 = x_0; x_0_0["Bidder_Tendency"] = 0
-x_0.3_0 = x_0; x_0.3_0["Bidder_Tendency"] = 0.3
-x_0.7_0 = x_0; x_0.7_0["Bidder_Tendency"] = 0.7
-x_1_0 = x_0; x_1_0["Bidder_Tendency"] = 1
+x_0_0 = x_0; x_0_0["Auction_Duration"] = 1
+x_0.3_0 = x_0; x_0.3_0["Auction_Duration"] = 3
+x_0.7_0 = x_0; x_0.7_0["Auction_Duration"] = 7
+x_1_0 = x_0; x_1_0["Auction_Duration"] = 10
 #for Successive_Outbidding = 0.5
-x_0_0.5 = x_0.5; x_0_0.5["Bidder_Tendency"] = 0
-x_0.3_0.5 = x_0.5; x_0.3_0.5["Bidder_Tendency"] = 0.3
-x_0.7_0.5 = x_0.5; x_0.7_0.5["Bidder_Tendency"] = 0.7
-x_1_0.5 = x_0.5; x_1_0.5["Bidder_Tendency"] = 1
+x_0_0.5 = x_0.5; x_0_0.5["Auction_Duration"] = 1
+x_0.3_0.5 = x_0.5; x_0.3_0.5["Auction_Duration"] = 3
+x_0.7_0.5 = x_0.5; x_0.7_0.5["Auction_Duration"] = 7
+x_1_0.5 = x_0.5; x_1_0.5["Auction_Duration"] = 10
 #for Successive_Outbidding = 1
-x_0_1 = x_1; x_0_1["Bidder_Tendency"] = 0
-x_0.3_1 = x_1; x_0.3_1["Bidder_Tendency"] = 0.3
-x_0.7_1 = x_1; x_0.7_1["Bidder_Tendency"] = 0.7
-x_1_1 = x_1; x_1_1["Bidder_Tendency"] = 1
+x_0_1 = x_1; x_0_1["Auction_Duration"] = 1
+x_0.3_1 = x_1; x_0.3_1["Auction_Duration"] = 3
+x_0.7_1 = x_1; x_0.7_1["Auction_Duration"] = 7
+x_1_1 = x_1; x_1_1["Auction_Duration"] = 10
 
 #configurations for the use of the most probable model
 coord_model = index.f[which(apply(gamma_sim[,index.f], 2, function(col) all(col == gamma_MP)))];length(coord_model)
@@ -1039,7 +1083,7 @@ lines(0:1, ypred_mean_0_0, type = "o", pch = 16, cex = 1.3, col = "violetred3", 
 lines(0:1, ypred_mean_0.3_0, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
 lines(0:1, ypred_mean_0.7_0, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
 lines(0:1, ypred_mean_1_0, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
-legend('topright', legend = c('BT = 0','BT = 0.3','BT = 0.7','BT = 1'),
+legend('topright', legend = c('AD = 1','AD = 3','AD = 7','AD = 10'),
        col = c("violetred3","skyblue4","orange4","seagreen"),
        lwd = 3,cex = 0.7, lty = 1)
 #SO = 0.5
@@ -1049,7 +1093,7 @@ lines(0:1, ypred_mean_0_0.5, type = "o", pch = 16, cex = 1.3, col = "violetred3"
 lines(0:1, ypred_mean_0.3_0.5, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
 lines(0:1, ypred_mean_0.7_0.5, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
 lines(0:1, ypred_mean_1_0.5, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
-legend('topright', legend = c('BT = 0','BT = 0.3','BT = 0.7','BT = 1'),
+legend('topright', legend = c('AD = 1','AD = 3','AD = 7','AD = 10'),
        col = c("violetred3","skyblue4","orange4","seagreen"),
        lwd = 3,cex = 0.7, lty = 1)
 #SO = 1
@@ -1059,9 +1103,10 @@ lines(0:1, ypred_mean_0_1, type = "o", pch = 16, cex = 1.3, col = "violetred3", 
 lines(0:1, ypred_mean_0.3_1, type = "o", pch = 16, cex = 1.3, col = "skyblue4", lwd = 2,lty = 3)
 lines(0:1, ypred_mean_0.7_1, type = "o", pch = 16, cex = 1.3, col = "orange4", lwd = 2,lty = 3)
 lines(0:1, ypred_mean_1_1, type = "o", pch = 16, cex = 1.3, col = "seagreen", lwd = 2,lty = 3)
-legend('topright', legend = c('BT = 0','BT = 0.3','BT = 0.7','BT = 1'),
+legend('topright', legend = c('AD = 1','AD = 3','AD = 7','AD = 10'),
        col = c("violetred3","skyblue4","orange4","seagreen"),
        lwd = 3,cex = 0.7, lty = 1)
 
+#PDF 10x4
 
 ### FIN.
