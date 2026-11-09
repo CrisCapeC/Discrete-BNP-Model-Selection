@@ -5,7 +5,9 @@
 rm(list = ls());gc()
 
 
-###########          Functions
+######################################################
+###########          Functions         ##############
+####################################################
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -24,6 +26,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
   #Prior hyperparameters
   beta0 = prior_params$beta0
   kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
   a_alpha = prior_params$a_alpha
   b_alpha = prior_params$b_alpha
   rho = prior_params$rho
@@ -55,7 +59,7 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Label and latent variables
     s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
-                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
                                     alpha = alpha, q = q)
     
     n_groups = s_z_ngroups$n_groups
@@ -71,8 +75,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Selector parameter (gamma)
     gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
-                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
-                                      prior_gamma = prior_gamma)
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
     gamma = gamma_and_q$gamma
     q = gamma_and_q$q
     X_gamma = X[, gamma == 1,drop = F]
@@ -84,7 +88,7 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Label and latent variables
     s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
-                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
                                     alpha = alpha, q = q)
     
     n_groups = s_z_ngroups$n_groups
@@ -100,8 +104,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Selector parameter (gamma)
     gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
-                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
-                                      prior_gamma = prior_gamma)
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
     gamma = gamma_and_q$gamma
     q = gamma_and_q$q
     X_gamma = X[, gamma == 1,drop = F]
@@ -154,7 +158,9 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-###########      MonteCarlo study
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
 library(parallel)
 
 ##### Simulation setup
@@ -163,7 +169,8 @@ n = 800 #Sample size
 true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
 true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
 true_params = list(beta = c(-1, -2, 1.5, -1.5, 1.2, -1.2))
-prior_params = list(kappa = 10, a_alpha = 0.1, b_alpha = 0.1, rho = 1) #Prior hyperparameters
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
 n_iter = 10000 #Length of chains
 n_burn = 2000 #burn-in period
 if(n == 200){
@@ -183,7 +190,7 @@ clu = makeCluster(n_cores)  #Create de cluster
 clusterEvalQ(clu,{
   library(Rcpp)
   library(RcppArmadillo)
-  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_BINARY_BNPMS_Neals_approach.cpp")
+  sourceCpp("C:/.../CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
 })
 #Exporting functions and objects
 clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
@@ -192,7 +199,7 @@ clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
 
 
 
-# Simulation
+##### MonteCarlo study
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -250,7 +257,7 @@ bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
 for(i in 1:100){
   
   #gamma simulation under each model
-  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/Logit/MonteCarloStudy_Logit_n800_",i,".rds")
+  file_route = paste0("C:/.../MonteCarloStudy_Logit_n800_",i,".rds")
   MonteCarloStudy_Logit_n800[[i]]$model_selection = model_selection = readRDS(file_route)
   
   #Object to save the distribution of gamma
@@ -276,6 +283,10 @@ saveRDS(MonteCarloStudy_Logit_n800, file = paste0("MonteCarloStudy_Logit_n800.rd
 
 
 
+
+
+
+
 ################################################################
 ######### Monte Carlo Study for Discrete BNPMS model ##########
 #########            Scenario: Cloglog              ##########
@@ -283,7 +294,9 @@ saveRDS(MonteCarloStudy_Logit_n800, file = paste0("MonteCarloStudy_Logit_n800.rd
 rm(list = ls());gc()
 
 
-###########          Functions
+######################################################
+###########          Functions         ##############
+####################################################
 
 ###### Discrete_BNPMS algorithm
 Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
@@ -302,6 +315,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
   #Prior hyperparameters
   beta0 = prior_params$beta0
   kappa = prior_params$kappa
+  a_sigma2 = prior_params$a_sigma2
+  b_sigma2 = prior_params$b_sigma2
   a_alpha = prior_params$a_alpha
   b_alpha = prior_params$b_alpha
   rho = prior_params$rho
@@ -333,7 +348,7 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Label and latent variables
     s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
-                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
                                     alpha = alpha, q = q)
     
     n_groups = s_z_ngroups$n_groups
@@ -349,8 +364,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Selector parameter (gamma)
     gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
-                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
-                                      prior_gamma = prior_gamma)
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
     gamma = gamma_and_q$gamma
     q = gamma_and_q$q
     X_gamma = X[, gamma == 1,drop = F]
@@ -362,7 +377,7 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Label and latent variables
     s_z_ngroups = s_z_simulationCPP(y = y, X_gamma = X_gamma, s = s, k = k, n_groups = n_groups, z = z, n = n, a = a,
-                                    beta0_gamma = beta0_gamma, kappa = kappa,
+                                    a_sigma2 = a_sigma2, b_sigma2 = b_sigma2, beta0_gamma = beta0_gamma, kappa = kappa,
                                     alpha = alpha, q = q)
     
     n_groups = s_z_ngroups$n_groups
@@ -378,8 +393,8 @@ Discrete_BNPMS = function(y, X, prior_params, n_iter, n_burn){
     
     #Selector parameter (gamma)
     gamma_and_q = gamma_simulationCPP(gamma = gamma, p = p, q = q, X = X, s = s, z = z, k = k,
-                                      n_groups = n_groups, beta0 = beta0, kappa = kappa,
-                                      prior_gamma = prior_gamma)
+                                      n_groups = n_groups, beta0 = beta0, kappa = kappa, a_sigma2 = a_sigma2,
+                                      b_sigma2 = b_sigma2, prior_gamma = prior_gamma)
     gamma = gamma_and_q$gamma
     q = gamma_and_q$q
     X_gamma = X[, gamma == 1,drop = F]
@@ -432,7 +447,9 @@ MonteCarloSimulation = function(replica_id, seeds, n, true_params, true_gamma,
 }
 
 
-###########      MonteCarlo study
+######################################################
+###########      MonteCarlo study      ##############
+####################################################
 library(parallel)
 
 ##### Simulation setup
@@ -441,7 +458,8 @@ n = 800 #Sample size
 true_gamma_aux = t(cbind(1,expand.grid(rep(list(c(0, 1)), 5)))) #All possible models (disordered)
 true_gamma = true_gamma_aux[, order(colSums(true_gamma_aux))];rownames(true_gamma) = NULL
 true_params = list(beta = c(-1, -2, 1.5, -1.5, 1.2, -1.2))
-prior_params = list(kappa = 10, a_alpha = 0.1, b_alpha = 0.1, rho = 1) #Prior hyperparameters
+prior_params = list(kappa = 10, a_sigma2 = 0.1, b_sigma2 = 0.1, a_alpha = 0.1,
+                    b_alpha = 0.1, rho = 1) #Prior hyperparameters
 n_iter = 10000 #Length of chains
 n_burn = 2000 #burn-in period
 if(n == 200){
@@ -461,14 +479,14 @@ clu = makeCluster(n_cores)  #Create de cluster
 clusterEvalQ(clu,{
   library(Rcpp)
   library(RcppArmadillo)
-  sourceCpp("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/CPPFunctions_for_BINARY_BNPMS_Neals_approach.cpp")
+  sourceCpp("C:/.../CPPFunctions_for_Discrete_BNPMS_Neals_approach.cpp")
 })
 #Exporting functions and objects
 clusterExport(clu, varlist = c("MonteCarloSimulation", "Discrete_BNPMS",
                                "seeds", "n", "true_params", "true_gamma", "prior_params",
                                "n_iter", "n_burn"))
 
-# Simulation
+##### MonteCarlo study
 library(tictoc)
 tic()
 MonteCarloStudy = parLapply(clu, X = 1:n_MC,
@@ -535,7 +553,7 @@ bar = txtProgressBar(min = 0, max = 100, style = 3) #Progress bar
 for(i in 1:100){
   
   #gamma simulation under each model
-  file_route = paste0("C:/Users/capet/Documents/Doctorado en Estadística/Tesis/Discrete BNPMS/Monte Carlo Study/Cloglog/MonteCarloStudy_Cloglog_n800_",i,".rds")
+  file_route = paste0("C:/.../MonteCarloStudy_Cloglog_n800_",i,".rds")
   MonteCarloStudy_Cloglog_n800[[i]]$model_selection = model_selection = readRDS(file_route)
   
   #Object to save the distribution of gamma
@@ -558,6 +576,13 @@ for(i in 1:100){
 close(bar)
 
 saveRDS(MonteCarloStudy_Cloglog_n800, file = paste0("MonteCarloStudy_Cloglog_n800.rds"))
+
+
+
+
+
+
+
 
 
 
